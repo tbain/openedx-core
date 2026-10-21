@@ -1284,6 +1284,28 @@ class TestObjectTagViewSet(TestTagTaxonomyMixin, APITestCase):
         assert response.status_code == status.HTTP_200_OK
         assert [t["value"] for t in response.data[object_id]["taxonomies"][0]["tags"]] == tag_values
 
+    def test_tag_object_clear_locked_tag_looks_the_same(self):
+        """
+        AC: the PUT that removes a deletion-locked tag returns the same status and body shape as one that removes an
+        unlocked tag.
+        """
+        self.client.force_authenticate(user=self.staff)
+        responses = {}
+        for object_id, locked in (("abc", True), ("problem7", False)):
+            api.tag_object(object_id=object_id, taxonomy=self.taxonomy, tags=["Mammalia"])
+            if locked:
+                api.lock_object_tags_for_deletion(ObjectTag.objects.get(object_id=object_id).pk)
+            url = OBJECT_TAGS_UPDATE_URL.format(object_id=object_id)
+            responses[locked] = self.client.put(
+                url, {"tagsData": [{"taxonomy": self.taxonomy.pk, "tags": []}]}, format="json"
+            )
+
+        assert responses[True].status_code == responses[False].status_code == status.HTTP_200_OK
+        assert responses[True].data == {"abc": {"taxonomies": []}}
+        assert responses[False].data == {"problem7": {"taxonomies": []}}
+        assert ObjectTag.objects.get(object_id="abc").archived is True
+        assert not ObjectTag.objects.filter(object_id="problem7").exists()
+
     @ddt.data(
         (None, status.HTTP_401_UNAUTHORIZED),
         ("user_1", status.HTTP_403_FORBIDDEN),
