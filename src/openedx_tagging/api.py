@@ -293,6 +293,8 @@ def get_object_tag_counts(object_id_pattern: str, count_implicit=False) -> dict[
 def delete_object_tags(object_id: str):
     """
     Delete all ObjectTag entries for a given object.
+
+    Locked associations (``deletion_locked=True``) are archived instead of deleted.
     """
     tags = ObjectTag.objects.filter(object_id=object_id)
 
@@ -342,6 +344,21 @@ def _get_current_tags(
     return current_tags
 
 
+def _save_object_tags(removed: list[ObjectTag], unarchive_pks: list[int], updated: list[ObjectTag]) -> None:
+    """
+    Apply the changes that :func:`tag_object` worked out, all in one transaction to avoid partial updates.
+    """
+    with transaction.atomic():
+        # Remove first to reduce the chances of UNIQUE constraint edge cases. Locked associations get archived.
+        if removed:
+            ObjectTag.objects.filter(pk__in=[object_tag.pk for object_tag in removed]).delete()
+        if unarchive_pks:
+            ObjectTag.objects.filter(pk__in=unarchive_pks).update(archived=False)
+        for object_tag in updated:
+            object_tag.full_clean()  # Run validation
+            object_tag.save()
+
+
 def tag_object(
     object_id: str,
     taxonomy: Taxonomy | None,
@@ -363,6 +380,9 @@ def tag_object(
     taxonomy_export_id: You can create object tags without taxonomy using this param
     and `taxonomy` as None. You need to use the taxonomy.export_id, so you can resync
     this object tag if the taxonomy is created in the future.
+
+    Re-applying a tag whose association is archived un-archives that same row and leaves ``deletion_locked``
+    unchanged. Omitted associations that are locked (``deletion_locked=True``) are archived instead of deleted.
     """
     if not isinstance(tags, list):
         raise ValueError(_("Tags must be a list, not {type}.").format(type=type(tags).__name__))
@@ -381,12 +401,15 @@ def tag_object(
     )
 
     updated_tags = []
+    unarchive_pks: list[int] = []
     if taxonomy and taxonomy.allow_free_text:
         for tag_value in tags:
             object_tag_index = next((i for (i, t) in enumerate(current_tags) if t.value == tag_value), -1)
             if object_tag_index >= 0:
                 # This tag is already applied.
                 object_tag = current_tags.pop(object_tag_index)
+                if object_tag.archived:
+                    unarchive_pks.append(object_tag.pk)
             else:
                 object_tag = ObjectTag(taxonomy=taxonomy, object_id=object_id, _value=tag_value)
                 updated_tags.append(object_tag)
@@ -409,6 +432,10 @@ def tag_object(
                 if object_tag_index >= 0:
                     # This tag is already applied.
                     object_tag = current_tags.pop(object_tag_index)
+                    if object_tag.archived:
+                        unarchive_pks.append(object_tag.pk)
+                        # Also clear it in memory, so the save() below can't write archived=True back.
+                        object_tag.archived = False
                     if object_tag._value != tag.value:  # pylint: disable=protected-access
                         # The ObjectTag's cached '_value' is out of sync with the Tag, so update it:
                         object_tag._value = tag.value  # pylint: disable=protected-access
@@ -434,15 +461,7 @@ def tag_object(
                     )
                     updated_tags.append(object_tag)
 
-    # Save all updated tags at once to avoid partial updates
-    with transaction.atomic():
-        # delete any omitted existing tags. We do this first to reduce chances of UNIQUE constraint edge cases
-        for old_tag in current_tags:
-            old_tag.delete()
-        # add the new tags:
-        for object_tag in updated_tags:
-            object_tag.full_clean()  # Run validation
-            object_tag.save()
+    _save_object_tags(current_tags, unarchive_pks, updated_tags)
 
 
 def add_tag_to_taxonomy(
@@ -506,6 +525,9 @@ def copy_tags(source_object_id: str, dest_object_id: str):
     previous copied tags of the dest object.
     If there are not-copied tags that also are in 'source_object_id',
     then they become copied.
+
+    Locked copied tags (``deletion_locked=True``) are archived instead of deleted. An archived destination
+    tag that the source still has is un-archived.
     """
     source_object_tags = get_object_tags(
         source_object_id,
@@ -525,7 +547,7 @@ def copy_tags(source_object_id: str, dest_object_id: str):
                 object_id=dest_object_id,
                 taxonomy_id=cast(int, object_tag.taxonomy_id),
                 tag_id=cast(int, object_tag.tag_id),
-                defaults={"is_copied": True},
+                defaults={"is_copied": True, "archived": False},
                 # Note: _value and _export_id are set automatically
             )
 

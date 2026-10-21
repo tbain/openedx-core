@@ -1336,3 +1336,63 @@ class TestTagExternalIdGeneration(TestTagTaxonomyMixin, TestCase):
             read_only_taxonomy.update_tag("RO Tag", "Renamed")
         with pytest.raises(ValueError):
             read_only_taxonomy.delete_tags(["RO Tag"])
+
+
+class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
+    """
+    Test that deleting ObjectTags archives deletion-locked ones instead of removing them.
+    """
+
+    def _object_tag(self, object_id: str, value: str, locked: bool = False) -> ObjectTag:
+        return ObjectTag.objects.create(
+            object_id=object_id,
+            taxonomy=self.free_text_taxonomy,
+            _value=value,
+            deletion_locked=locked,
+        )
+
+    def test_direct_deletes_archive_locked_rows(self) -> None:
+        """
+        AC: instance and bulk deletes archive locked rows, remove unlocked ones, and return the same shape for both.
+        """
+        label = ObjectTag._meta.label
+        locked = self._object_tag("obj1", "locked", locked=True)
+
+        assert locked.delete() == (1, {label: 1})
+
+        assert locked.archived is True
+        assert locked.pk is not None
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+
+        unlocked = self._object_tag("obj2", "unlocked")
+        pk = unlocked.pk
+
+        assert unlocked.delete() == (1, {label: 1})
+
+        assert unlocked.pk is None
+        assert not ObjectTag.objects.filter(pk=pk).exists()
+
+        bulk_locked = self._object_tag("obj3", "locked", locked=True)
+        bulk_unlocked = self._object_tag("obj3", "unlocked")
+
+        assert ObjectTag.objects.filter(object_id="obj3").delete() == (2, {label: 2})
+
+        assert ObjectTag.objects.get(pk=bulk_locked.pk).archived is True
+        assert not ObjectTag.objects.filter(pk=bulk_unlocked.pk).exists()
+
+    def test_delete_guards_match_django(self) -> None:
+        """
+        Guard: deletes that Django's own delete() refuses are refused here too, with the same messages.
+        """
+        values_message = r"Cannot call delete\(\) after .values\(\) or .values_list\(\)"
+        with pytest.raises(TypeError, match="Cannot use 'limit' or 'offset' with delete"):
+            ObjectTag.objects.all()[:1].delete()
+        with pytest.raises(TypeError, match=values_message):
+            ObjectTag.objects.values("pk").delete()
+        with pytest.raises(TypeError, match=values_message):
+            ObjectTag.objects.values_list("pk").delete()
+        with pytest.raises(TypeError, match=r"Cannot call delete\(\) after .distinct\(\*fields\)"):
+            ObjectTag.objects.distinct("object_id").delete()
+        unsaved = ObjectTag(object_id="obj1", taxonomy=self.free_text_taxonomy, _value="value")
+        with pytest.raises(ValueError, match="can't be deleted because its id attribute is set to None"):
+            unsaved.delete()
