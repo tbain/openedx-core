@@ -97,6 +97,7 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
         :return: Django's ``(total, {model_label: count})`` result for the objects deleted and archived.
         :raises TypeError: If the queryset is sliced, or was built with ``distinct(*fields)``, ``values()`` or
             ``values_list()``, as for Django's own ``QuerySet.delete()``.
+        :raises NotSupportedError: If the queryset was built with ``union()``, ``intersection()`` or ``difference()``.
         """
         if self.query.combinator:
             raise NotSupportedError(f"Calling QuerySet.delete() after {self.query.combinator}() is not supported.")

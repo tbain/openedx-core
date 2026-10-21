@@ -1610,7 +1610,7 @@ class TestArchiveLockedObjectTags(TestTagTaxonomyMixin, TestCase):
         assert reapplied.deletion_locked is True
 
     def test_tag_object_query_count_is_constant(self) -> None:
-        """Tag_object removing a mixed set of tags runs the same queries however many tags it removes."""
+        """`tag_object()` removing a mixed set of tags runs the same queries however many tags it removes."""
         counts = []
         for object_id, size in (("small", 2), ("large", 20)):
             values = [f"{object_id} {index}" for index in range(size)]
