@@ -12,7 +12,9 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import F
 from django.db.utils import IntegrityError
+from django.test import override_settings
 from django.test.testcases import TestCase
 
 from openedx_tagging import api
@@ -1312,6 +1314,18 @@ class TestTagExternalIdGeneration(TestTagTaxonomyMixin, TestCase):
             read_only_taxonomy.delete_tags(["RO Tag"])
 
 
+class ReplicaRouter:
+    """
+    Sends reads to a database alias that isn't configured, and writes to the default one.
+    """
+
+    def db_for_read(self, _model, **_hints):
+        return "replica"
+
+    def db_for_write(self, _model, **_hints):
+        return "default"
+
+
 class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
     """
     Test that deleting ObjectTags archives deletion-locked ones instead of removing them.
@@ -1365,8 +1379,25 @@ class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
             ObjectTag.objects.values("pk").delete()
         with pytest.raises(TypeError, match=values_message):
             ObjectTag.objects.values_list("pk").delete()
+        with pytest.raises(TypeError, match=values_message):
+            ObjectTag.objects.values(alias=F("pk")).delete()
         with pytest.raises(TypeError, match=r"Cannot call delete\(\) after .distinct\(\*fields\)"):
             ObjectTag.objects.distinct("object_id").delete()
         unsaved = ObjectTag(object_id="obj1", taxonomy=self.free_text_taxonomy, _value="value")
         with pytest.raises(ValueError, match="can't be deleted because its id attribute is set to None"):
             unsaved.delete()
+
+    def test_bulk_delete_uses_write_database(self) -> None:
+        """
+        A bulk delete locks, archives and deletes on the write database, never the read one.
+        """
+        locked = self._object_tag("obj1", "locked", locked=True)
+        unlocked = self._object_tag("obj1", "unlocked")
+
+        # The read alias isn't configured, so any query routed to it would raise.
+        with override_settings(DATABASE_ROUTERS=[ReplicaRouter()]):
+            result = ObjectTag.objects.filter(object_id="obj1").delete()
+
+        assert result == (2, {ObjectTag._meta.label: 2})
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+        assert not ObjectTag.objects.filter(pk=unlocked.pk).exists()

@@ -1437,26 +1437,67 @@ class TestArchiveLockedObjectTags(TestTagTaxonomyMixin, TestCase):
         assert reimported.archived is False
         assert reimported.deletion_locked is True
 
-    def test_copy_tags_archives_dropped_locked_copy_and_keeps_shared_one(self) -> None:
+    @ddt.data("taxonomy", "free_text_taxonomy")
+    def test_copy_tags_archives_dropped_locked_copy_and_keeps_shared_one(self, taxonomy_attr: str) -> None:
         """
         AC: library sync archives a locked copy the source dropped and keeps one it still has; never copies archived.
         """
-        self._apply("source", ["Mammalia", "Fungi"])
+        taxonomy = getattr(self, taxonomy_attr)
+        self._apply("source", ["Mammalia", "Fungi"], taxonomy)
         tagging_api.copy_tags("source", "dest")
-        kept = self._locked("dest", "Mammalia")
-        dropped = self._locked("dest", "Fungi")
-        self._apply("source", ["Mammalia"])
-        ObjectTag.objects.create(object_id="source", taxonomy=self.taxonomy, tag=self.archaea, archived=True)
+        kept = self._locked("dest", "Mammalia", taxonomy)
+        dropped = self._locked("dest", "Fungi", taxonomy)
+        self._apply("source", ["Mammalia", "Archaea", "Chordata"], taxonomy)
+        ObjectTag.objects.filter(object_id="source", _value="Chordata").update(archived=True)
 
         tagging_api.copy_tags("source", "dest")
 
-        still_kept = self._object_tag("dest", "Mammalia")
+        still_kept = self._object_tag("dest", "Mammalia", taxonomy)
         assert still_kept.pk == kept.pk
         assert still_kept.archived is False
         assert still_kept.is_copied is True
         assert still_kept.deletion_locked is True
         assert ObjectTag.objects.get(pk=dropped.pk).archived is True
-        assert not ObjectTag.objects.filter(object_id="dest", _value="Archaea").exists()
+        copied = self._object_tag("dest", "Archaea", taxonomy)
+        assert copied.is_copied is True
+        assert copied.archived is False
+        assert not ObjectTag.objects.filter(object_id="dest", _value="Chordata").exists()
+
+    @ddt.data("known_taxonomy", "no_taxonomy")
+    def test_reimport_restores_unresolved_association(self, case: str) -> None:
+        """
+        AC: re-import restores the same row for an association whose tag can't be resolved.
+        """
+        taxonomy = self.taxonomy if case == "known_taxonomy" else None
+        kwargs: dict[str, Any] = {"create_invalid": True} if taxonomy else {"taxonomy_export_id": "unknown_taxonomy"}
+        tagging_api.tag_object("obj1", taxonomy, ["Not a real tag"], **kwargs)
+        unresolved = ObjectTag.objects.get(object_id="obj1")
+        tagging_api.lock_object_tags_for_deletion(unresolved.pk)
+
+        tagging_api.delete_object_tags("obj1")
+        assert ObjectTag.objects.get(pk=unresolved.pk).archived is True
+        tagging_api.tag_object("obj1", taxonomy, ["Not a real tag"], **kwargs)
+
+        reimported = ObjectTag.objects.get(object_id="obj1")
+        assert reimported.pk == unresolved.pk
+        assert reimported.archived is False
+        assert reimported.deletion_locked is True
+
+    def test_archived_associations_do_not_count_toward_tag_limit(self) -> None:
+        """
+        Archived associations don't count toward OBJECT_MAX_TAGS.
+        """
+        with patch("openedx_tagging.api.OBJECT_MAX_TAGS", 2):
+            self._apply("obj1", ["Mammalia", "Fungi"])
+            for value in ("Mammalia", "Fungi"):
+                self._locked("obj1", value)
+            self._apply("obj1", [])
+            assert ObjectTag.objects.filter(object_id="obj1", archived=True).count() == 2
+
+            self._apply("obj1", ["one", "two"], self.free_text_taxonomy)
+
+            with pytest.raises(ValueError, match="Cannot add more than 2 tags"):
+                self._apply("obj1", ["Tag 4"], self.import_taxonomy)
 
     def test_reapplying_with_stale_value_ends_unarchived(self) -> None:
         """Re-applying an archived row whose _value is out of date still ends unarchived in the database."""
