@@ -104,19 +104,22 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
             raise TypeError("Cannot use 'limit' or 'offset' with delete().")
         if self.query.distinct_fields:
             raise TypeError("Cannot call delete() after .distinct(*fields).")
-        if self.query.values_select:
+        # django-stubs doesn't declare _fields, which Django's own delete() checks to reject values() and values_list().
+        if getattr(self, "_fields", None) is not None:
             raise TypeError("Cannot call delete() after .values() or .values_list()")
 
-        manager = self.model.objects.using(self.db)
-        with transaction.atomic(using=self.db):
-            # Lock every row before reading its flag, so that a concurrent lock_object_tags_for_deletion() call waits
-            # for this transaction and then sees the row archived, rather than racing us and leaving it live.
+        # select_for_update() marks the queryset for writing, so only then does .db name the write database,
+        # while still honoring an explicit .using().
+        locking_qs = self.select_for_update()
+        db = locking_qs.db
+        if connections[db].features.has_select_for_update_of:
             # of=("self",) keeps MySQL and PostgreSQL from also locking the joined Tag and Taxonomy rows, and
             # MariaDB doesn't support it.
-            if connections[self.db].features.has_select_for_update_of:
-                locking_qs = self.select_for_update(of=("self",))
-            else:
-                locking_qs = self.select_for_update()
+            locking_qs = locking_qs.select_for_update(of=("self",))
+        manager = self.model.objects.using(db)
+        with transaction.atomic(using=db):
+            # Lock every row before reading its flag, so that a concurrent lock_object_tags_for_deletion() call waits
+            # for this transaction and then sees the row archived, rather than racing us and leaving it live.
             rows = list(locking_qs.values_list("pk", "deletion_locked"))
             locked_ids = [pk for pk, locked in rows if locked]
             unlocked_ids = [pk for pk, locked in rows if not locked]
