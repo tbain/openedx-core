@@ -17,7 +17,7 @@ from collections.abc import Iterable
 from enum import Enum
 from typing import Any, Counter, cast
 
-from django.db import models, transaction
+from django.db import models, router, transaction
 from django.db.models import F, QuerySet, Value
 from django.db.models.functions import Coalesce, Concat, Lower
 from django.utils.text import slugify
@@ -357,22 +357,33 @@ def _pop_current_tag(
     Find the existing association for a re-applied tag, so it can be reused instead of recreated.
 
     Matches on ``tag_id`` when one is given. Otherwise matches an association with no tag whose value equals
-    ``value`` ignoring case, as the ``_value`` column's collation does. The match is removed from ``current_tags``,
-    added to ``unarchive_pks`` if it is archived, and added to ``updated_tags`` if its stored value differs from
-    ``value``.
+    ``value`` under the database's collation for ``_value``, so it agrees with the unique constraint. If several
+    match, which only the no-taxonomy path allows, it prefers an exact spelling, then a locked one, then the lowest
+    pk. The match is removed from ``current_tags``, added to ``unarchive_pks`` if it is archived, and added to
+    ``updated_tags`` if its stored value differs from ``value``.
 
     :return: ``True`` if an existing association matched, ``False`` if the caller needs to create one.
     """
-    for index, object_tag in enumerate(current_tags):
-        if tag_id is not None:
-            matched = object_tag.tag_id == tag_id
-        else:
-            matched = object_tag.tag_id is None and object_tag.value.casefold() == value.casefold()
-        if matched:
-            break
+    if tag_id is not None:
+        matches = [t for t in current_tags if t.tag_id == tag_id]
     else:
+        candidates = [t for t in current_tags if t.tag_id is None]
+        # An identical spelling is equal under any collation, so only ask the database when there isn't one.
+        matches = [t for t in candidates if t.value == value]
+        if not matches and candidates:
+            equal_pks = set(
+                ObjectTag.objects.using(router.db_for_write(ObjectTag))
+                .filter(pk__in=[t.pk for t in candidates], _value=value)
+                .values_list("pk", flat=True)
+            )
+            matches = [t for t in candidates if t.pk in equal_pks]
+    if not matches:
         return False
-    current_tags.pop(index)
+    # Only value matches can be ambiguous, and they have no tag, so .value doesn't query for one.
+    object_tag = matches[0] if tag_id is not None else min(
+        matches, key=lambda t: (t.value != value, not t.deletion_locked, t.pk)
+    )
+    current_tags.remove(object_tag)
     if object_tag.archived:
         unarchive_pks.append(object_tag.pk)
         # Also clear it in memory, so a later save() of this instance can't write archived=True back.

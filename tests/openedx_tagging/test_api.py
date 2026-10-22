@@ -1501,6 +1501,76 @@ class TestArchiveLockedObjectTags(TestTagTaxonomyMixin, TestCase):
             with pytest.raises(ValueError, match="Cannot add more than 2 tags"):
                 self._apply("obj1", ["Tag 4"], self.import_taxonomy)
 
+    @ddt.data(("Alpha", "alpha"), ("ß", "ss"), ("café", "cafe"))
+    @ddt.unpack
+    def test_reapply_follows_database_collation(self, first: str, second: str) -> None:
+        """
+        Re-applying a value restores the archived row exactly when the database considers the values equal.
+        """
+        taxonomy = self.free_text_taxonomy
+        self._apply("obj1", [first], taxonomy)
+        locked = self._locked("obj1", first, taxonomy)
+        self._apply("obj1", [], taxonomy)
+        same = ObjectTag.objects.filter(pk=locked.pk, _value=second).exists()
+        known = {
+            "sqlite": {("Alpha", "alpha"): True, ("ß", "ss"): False, ("café", "cafe"): False},
+            "mysql": {("Alpha", "alpha"): True, ("café", "cafe"): True},  # ß is left out: not sure of its collation
+        }
+        if (first, second) in known.get(connection.vendor, {}):
+            assert same is known[connection.vendor][(first, second)]
+
+        self._apply("obj1", [second], taxonomy)
+
+        if same:
+            reapplied = ObjectTag.objects.get(object_id="obj1")
+            assert reapplied.pk == locked.pk
+            assert reapplied.value == second
+            assert reapplied.archived is False
+            assert reapplied.deletion_locked is True
+        else:
+            still_archived = ObjectTag.objects.get(pk=locked.pk)
+            assert still_archived.value == first
+            assert still_archived.archived is True
+            new_tag = ObjectTag.objects.get(object_id="obj1", archived=False)
+            assert new_tag.pk != locked.pk
+            assert new_tag.value == second
+            assert new_tag.deletion_locked is False
+
+    def test_reapply_without_taxonomy_prefers_locked_match(self) -> None:
+        """
+        With several matching associations, re-applying reuses the locked one and removes the others.
+        """
+        kwargs: dict[str, Any] = {"taxonomy_export_id": "gone"}
+        tagging_api.tag_object("obj1", None, ["Alpha", "alpha"], **kwargs)  # No unique constraint without a taxonomy
+        assert ObjectTag.objects.filter(object_id="obj1").count() == 2
+        # Pick by exact spelling in Python, since filtering on _value would match both rows.
+        locked = next(t for t in ObjectTag.objects.filter(object_id="obj1") if t.value == "alpha")
+        tagging_api.lock_object_tags_for_deletion(locked.pk)
+
+        tagging_api.tag_object("obj1", None, ["ALPHA"], **kwargs)
+
+        reapplied = ObjectTag.objects.get(object_id="obj1")
+        assert reapplied.pk == locked.pk
+        assert reapplied.value == "ALPHA"
+        assert reapplied.archived is False
+        assert reapplied.deletion_locked is True
+
+    def test_reapply_two_values_for_one_row_fails_atomically(self) -> None:
+        """
+        Two values that the database treats as equal can't both be applied, and nothing is written.
+        """
+        self._apply("obj1", ["Alpha"], self.free_text_taxonomy)
+        locked = self._locked("obj1", "Alpha", self.free_text_taxonomy)
+        self._apply("obj1", [], self.free_text_taxonomy)
+
+        with pytest.raises(ValidationError):
+            self._apply("obj1", ["Alpha", "alpha"], self.free_text_taxonomy)
+
+        only_row = ObjectTag.objects.get(object_id="obj1")
+        assert only_row.pk == locked.pk
+        assert only_row.value == "Alpha"
+        assert only_row.archived is True
+
     def test_reapplying_with_stale_value_ends_unarchived(self) -> None:
         """Re-applying an archived row whose _value is out of date still ends unarchived in the database."""
         self._apply("obj1", ["Mammalia"])
