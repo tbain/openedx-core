@@ -133,7 +133,9 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
             if archived_count:
                 label = self.model._meta.label
                 per_model[label] = per_model.get(label, 0) + archived_count
-            return deleted + archived_count, per_model
+
+        self._result_cache = None
+        return deleted + archived_count, per_model
 
 
 class Tag(models.Model):

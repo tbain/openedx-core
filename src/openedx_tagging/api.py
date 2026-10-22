@@ -350,31 +350,39 @@ def _get_current_tags(
 def _pop_current_tag(
     current_tags: list[ObjectTag],
     unarchive_pks: list[int],
+    updated_tags: list[ObjectTag],
+    value: str,
     tag_id: int | None = None,
-    value: str | None = None,
-) -> ObjectTag | None:
+) -> bool:
     """
-    Remove and return the current tag that a re-applied tag matches, or ``None`` if there isn't one.
+    Find the existing association for a re-applied tag, so it can be reused instead of recreated.
 
-    A tag with a ``tag_id`` matches on it, since a stored ``_value`` can be stale. Otherwise the match is an
-    unresolved association (no ``tag``) with this ``value``, mirroring the ``(object_id, taxonomy, _value)`` unique
-    constraint. A match that is archived is added to ``unarchive_pks``.
+    Matches on ``tag_id`` when one is given. Otherwise matches an association with no tag whose value equals
+    ``value`` ignoring case, as the ``_value`` column's collation does. The match is removed from ``current_tags``,
+    added to ``unarchive_pks`` if it is archived, and added to ``updated_tags`` if its stored value differs from
+    ``value``.
+
+    :return: ``True`` if an existing association matched, ``False`` if the caller needs to create one.
     """
     for index, object_tag in enumerate(current_tags):
         if tag_id is not None:
             matched = object_tag.tag_id == tag_id
         else:
-            matched = object_tag.tag_id is None and object_tag.value == value
+            matched = object_tag.tag_id is None and object_tag.value.casefold() == value.casefold()
         if matched:
             break
     else:
-        return None
+        return False
     current_tags.pop(index)
     if object_tag.archived:
         unarchive_pks.append(object_tag.pk)
         # Also clear it in memory, so a later save() of this instance can't write archived=True back.
         object_tag.archived = False
-    return object_tag
+    if object_tag._value != value:  # pylint: disable=protected-access
+        # The ObjectTag's cached '_value' is out of sync with the Tag or the casing, so update it:
+        object_tag._value = value  # pylint: disable=protected-access
+        updated_tags.append(object_tag)
+    return True
 
 
 def _save_object_tags(removed: list[ObjectTag], unarchive_pks: list[int], updated: list[ObjectTag]) -> None:
@@ -433,11 +441,11 @@ def tag_object(
         taxonomy_export_id
     )
 
-    updated_tags = []
+    updated_tags: list[ObjectTag] = []
     unarchive_pks: list[int] = []
     if taxonomy and taxonomy.allow_free_text:
         for tag_value in tags:
-            if not _pop_current_tag(current_tags, unarchive_pks, value=tag_value):
+            if not _pop_current_tag(current_tags, unarchive_pks, updated_tags, value=tag_value):
                 object_tag = ObjectTag(taxonomy=taxonomy, object_id=object_id, _value=tag_value)
                 updated_tags.append(object_tag)
     else:
@@ -455,25 +463,21 @@ def tag_object(
 
             if tag:
                 # Tag exists in the taxonomy
-                applied_tag = _pop_current_tag(current_tags, unarchive_pks, tag_id=tag.id)
-                if applied_tag:
-                    # This tag is already applied.
-                    if applied_tag._value != tag.value:  # pylint: disable=protected-access
-                        # The ObjectTag's cached '_value' is out of sync with the Tag, so update it:
-                        applied_tag._value = tag.value  # pylint: disable=protected-access
-                        updated_tags.append(applied_tag)
-                else:
+                # If this tag is already applied, the helper also fixes the row's cached '_value' if it's out of sync.
+                if not _pop_current_tag(current_tags, unarchive_pks, updated_tags, value=tag.value, tag_id=tag.id):
                     # We are newly applying this tag:
                     object_tag = ObjectTag(taxonomy=taxonomy, object_id=object_id, tag=tag)
                     updated_tags.append(object_tag)
             elif taxonomy:
                 # Tag doesn't exist in the taxonomy and `create_invalid` is True
-                if not _pop_current_tag(current_tags, unarchive_pks, value=tag_value):
+                if not _pop_current_tag(current_tags, unarchive_pks, updated_tags, value=tag_value):
                     object_tag = ObjectTag(taxonomy=taxonomy, object_id=object_id, _value=tag_value)
                     updated_tags.append(object_tag)
             else:
                 # Taxonomy is None (also tag doesn't exist)
-                if taxonomy_export_id and not _pop_current_tag(current_tags, unarchive_pks, value=tag_value):
+                if taxonomy_export_id and not _pop_current_tag(
+                    current_tags, unarchive_pks, updated_tags, value=tag_value
+                ):
                     # `taxonomy_export_id` will always be true, since it is verified at the beginning of the function.
                     # This condition is placed by the type checks.
                     object_tag = ObjectTag(

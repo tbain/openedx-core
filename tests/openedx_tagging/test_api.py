@@ -1503,12 +1503,14 @@ class TestArchiveLockedObjectTags(TestTagTaxonomyMixin, TestCase):
         assert self._object_tag("obj1", "Archaea", taxonomy).archived is False
         assert [t.value for t in tagging_api.get_object_tags("obj1")] == ["Archaea"]
 
-        self._apply("obj1", ["Mammalia"], taxonomy)
+        # The lowercase re-apply is deliberate: the unique constraint is case-insensitive, so it must still match.
+        self._apply("obj1", ["mammalia"], taxonomy)
 
         reapplied = self._object_tag("obj1", "Mammalia", taxonomy)
         assert reapplied.pk == locked.pk
         assert reapplied.archived is False
         assert reapplied.deletion_locked is True
+        assert reapplied.value == ("mammalia" if taxonomy.allow_free_text else "Mammalia")
         assert ObjectTag.objects.filter(object_id="obj1", _value="Mammalia").count() == 1
 
     def test_delete_object_tags_archives_locked_and_reimport_restores(self) -> None:
