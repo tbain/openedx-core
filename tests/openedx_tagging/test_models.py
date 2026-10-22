@@ -1363,9 +1363,12 @@ class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
         bulk_locked = self._object_tag("obj3", "locked", locked=True)
         bulk_unlocked = self._object_tag("obj3", "unlocked")
 
-        assert ObjectTag.objects.filter(object_id="obj3").delete() == (2, {label: 2})
+        bulk = ObjectTag.objects.filter(object_id="obj3")
+        assert len(list(bulk)) == 2  # Evaluate it, so the delete has a result cache to clear
 
-        assert ObjectTag.objects.get(pk=bulk_locked.pk).archived is True
+        assert bulk.delete() == (2, {label: 2})
+
+        assert [(t.pk, t.archived) for t in bulk] == [(bulk_locked.pk, True)]
         assert not ObjectTag.objects.filter(pk=bulk_unlocked.pk).exists()
 
     def test_delete_guards_match_django(self) -> None:
