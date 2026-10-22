@@ -8,7 +8,7 @@ import re
 from typing import List, Self, cast
 
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import NotSupportedError, connections, models, router, transaction
 from django.db.models import F, Value
 from django.db.models.functions import Concat, Length, Replace, Substr
 from django.utils.functional import cached_property
@@ -84,6 +84,58 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
             .exclude(tag__taxonomy__archived=True)
             .exclude(taxonomy__archived=True)
         )
+
+    def delete(self) -> tuple[int, dict[str, int]]:
+        """
+        Delete these object tags, except that deletion-locked ones are archived instead.
+
+        An object tag with ``deletion_locked=True`` records an association that must be preserved, so it gets
+        ``archived=True`` and stays in the database. Archived rows are counted in the returned total, so a caller can't
+        tell which of the two happened. Raw SQL bypasses this. No foreign key cascades into ``ObjectTag``, because its
+        ``tag`` and ``taxonomy`` fields are ``SET_NULL``, so deleting a tag or taxonomy never reaches this method.
+
+        :return: Django's ``(total, {model_label: count})`` result for the objects deleted and archived.
+        :raises TypeError: If the queryset is sliced, or was built with ``distinct(*fields)``, ``values()`` or
+            ``values_list()``, as for Django's own ``QuerySet.delete()``.
+        :raises NotSupportedError: If the queryset was built with ``union()``, ``intersection()`` or ``difference()``.
+        """
+        if self.query.combinator:
+            raise NotSupportedError(f"Calling QuerySet.delete() after {self.query.combinator}() is not supported.")
+        if self.query.is_sliced:
+            raise TypeError("Cannot use 'limit' or 'offset' with delete().")
+        if self.query.distinct_fields:
+            raise TypeError("Cannot call delete() after .distinct(*fields).")
+        # django-stubs doesn't declare _fields, which Django's own delete() checks to reject values() and values_list().
+        if getattr(self, "_fields", None) is not None:
+            raise TypeError("Cannot call delete() after .values() or .values_list()")
+
+        # select_for_update() marks the queryset for writing, so only then does .db name the write database,
+        # while still honoring an explicit .using().
+        locking_qs = self.select_for_update()
+        db = locking_qs.db
+        if connections[db].features.has_select_for_update_of:
+            # of=("self",) keeps MySQL and PostgreSQL from also locking the joined Tag and Taxonomy rows, and
+            # MariaDB doesn't support it.
+            locking_qs = locking_qs.select_for_update(of=("self",))
+        manager = self.model.objects.using(db)
+        with transaction.atomic(using=db):
+            # Lock every row before reading its flag, so that a concurrent lock_object_tags_for_deletion() call waits
+            # for this transaction and then sees the row archived, rather than racing us and leaving it live.
+            rows = list(locking_qs.values_list("pk", "deletion_locked"))
+            locked_ids = [pk for pk, locked in rows if locked]
+            unlocked_ids = [pk for pk, locked in rows if not locked]
+            archived_count = manager.filter(pk__in=locked_ids).update(archived=True) if locked_ids else 0
+            deleted = 0
+            per_model: dict[str, int] = {}
+            if unlocked_ids:
+                # Call Django's implementation directly, since this method would otherwise recurse into itself.
+                deleted, per_model = models.QuerySet.delete(manager.filter(pk__in=unlocked_ids))
+            if archived_count:
+                label = self.model._meta.label
+                per_model[label] = per_model.get(label, 0) + archived_count
+
+        self._result_cache = None
+        return deleted + archived_count, per_model
 
 
 class Tag(models.Model):
@@ -850,6 +902,32 @@ class ObjectTag(models.Model):
                 self._export_id = self.taxonomy.export_id
             if not self._value and self.tag:
                 self._value = self.tag.value
+
+    def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
+        """
+        Delete this object tag, if deletion-locked archive instead.
+
+        A locked association (``deletion_locked=True``) is archived and stays in the database; ``self.archived``
+        is updated to match. Otherwise the row is deleted. The return value counts an archived row as deleted,
+        so a caller can't tell which happened. Raw SQL bypasses this. No foreign key cascades into ``ObjectTag``,
+        because its ``tag`` and ``taxonomy`` fields are ``SET_NULL``.
+
+        :param using: The database alias to delete from, defaulting to the one Django's router picks for writes.
+        :param keep_parents: Accepted for compatibility with Django, and meaningless here because ``ObjectTag`` has no
+            multi-table parents.
+        :raises ValueError: If the object tag hasn't been saved.
+        """
+        if self.pk is None:
+            raise ValueError(
+                f"{type(self).__name__} object can't be deleted because its id attribute is set to None."
+            )
+        manager = type(self).objects.using(using or router.db_for_write(type(self), instance=self))
+        result = manager.filter(pk=self.pk).delete()
+        if manager.filter(pk=self.pk).exists():
+            self.archived = True
+        else:
+            self.pk = None
+        return result
 
     def __repr__(self):
         """
