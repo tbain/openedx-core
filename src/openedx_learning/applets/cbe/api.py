@@ -18,7 +18,7 @@ from opaque_keys.edx.keys import UsageKey
 
 from openedx_catalog.api import get_course_run
 from openedx_catalog.models_api import CourseRun
-from openedx_tagging.api import create_taxonomy, get_object_tags, tag_object
+from openedx_tagging.api import create_taxonomy, get_object_tags, lock_object_tags_for_deletion, tag_object
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
 from openedx_tagging.rules import ObjectTagPermissionItem, UserType
 
@@ -613,7 +613,13 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
     raised, where ``0`` means nothing changed. This function performs no authorization check of its
     own; as with ``openedx_tagging.api``, the caller is responsible for enforcing permissions.
 
+    The tag association (``ObjectTag``) behind each criterion whose status is recorded is locked against
+    deletion (``deletion_locked``) in the same transaction, so that it is archived rather than removed later.
+    The lock is permanent.
+
     :raises TransactionManagementError: if called outside an atomic block.
+    :raises ObjectTag.DoesNotExist: if a tag association behind an evaluated criterion is deleted while this
+        function runs, in which case the caller's transaction rolls the statuses back with it.
     """
     # In autocommit mode get_or_create() would commit a leaf row on its own, apart from the grade.
     if not connection.in_atomic_block:
@@ -639,6 +645,7 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
 
     now = datetime.now(tz=timezone.utc)
     changed = 0
+    locked_object_tag_ids: set[int] = set()
     for criterion in criteria:
         fraction = fraction_by_object_id[criterion.object_tag.object_id]
         rule_type, payload = _effective_rule(criterion)
@@ -651,6 +658,9 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
             )
             continue
         status = MasteryStatus.DEMONSTRATED if demonstrated else MasteryStatus.ATTEMPTED_NOT_DEMONSTRATED
+        locked_object_tag_ids.add(criterion.object_tag_id)
         changed += _raise_leaf_status(user_id, criterion.pk, status, now)
 
+    if locked_object_tag_ids:
+        lock_object_tags_for_deletion(locked_object_tag_ids)
     return changed
