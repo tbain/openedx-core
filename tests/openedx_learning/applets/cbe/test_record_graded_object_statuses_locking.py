@@ -21,7 +21,12 @@ from openedx_learning.models import (
     RuleType,
     StudentCompetencyCriterionStatus,
 )
-from openedx_tagging.api import delete_object_tags, get_tags_locked_for_deletion, is_taxonomy_locked_for_deletion
+from openedx_tagging.api import (
+    delete_object_tags,
+    get_tags_locked_for_deletion,
+    is_taxonomy_locked_for_deletion,
+    tag_object,
+)
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
 
 pytestmark = pytest.mark.django_db
@@ -202,10 +207,10 @@ def test_criterion_whose_status_already_exists_is_still_locked(
     assert object_tag.deletion_locked is True
 
 
-@pytest.mark.usefixtures("criterion")
 def test_deleting_locked_association_archives_it_and_protects_tag_and_taxonomy(
-    user, object_tag: ObjectTag, tag: Tag, competency_taxonomy: CompetencyTaxonomy
+    user, criterion: CompetencyCriterion, object_tag: ObjectTag, tag: Tag, competency_taxonomy: CompetencyTaxonomy
 ) -> None:
+    """Deleting a locked association archives it, protects its tag and taxonomy, and keeps the status resolving."""
     record_graded_object_statuses(user_id=user.id, scores=[_score(object_tag)])
     assert get_tags_locked_for_deletion([tag.id]) == {tag.id}
     assert is_taxonomy_locked_for_deletion(competency_taxonomy.id) is True
@@ -219,3 +224,26 @@ def test_deleting_locked_association_archives_it_and_protects_tag_and_taxonomy(
     assert is_taxonomy_locked_for_deletion(competency_taxonomy.id) is True
     assert not hasattr(Tag, "deletion_locked")
     assert not hasattr(Taxonomy, "deletion_locked")
+    status = StudentCompetencyCriterionStatus.objects.get(criterion=criterion, user_id=user.id)
+    assert status.criterion.object_tag_id == object_tag.id
+
+
+def test_archived_association_records_no_new_mastery(
+    user, criterion: CompetencyCriterion, object_tag: ObjectTag, competency_taxonomy: CompetencyTaxonomy
+) -> None:
+    """
+    A criterion whose tag association was archived after a learner earned a status through it records no mastery
+    for a later learner, while the earlier learner's status still resolves through the archived association.
+    """
+    record_graded_object_statuses(user_id=user.id, scores=[_score(object_tag)])
+    tag_object(object_tag.object_id, competency_taxonomy, [])
+    object_tag.refresh_from_db()
+    assert object_tag.archived is True
+    second_user = get_user_model().objects.create(username="learner2")
+
+    changed = record_graded_object_statuses(user_id=second_user.id, scores=[_score(object_tag)])
+
+    assert changed == 0
+    assert not StudentCompetencyCriterionStatus.objects.filter(criterion=criterion, user_id=second_user.id).exists()
+    first_status = StudentCompetencyCriterionStatus.objects.get(criterion=criterion, user_id=user.id)
+    assert first_status.criterion.object_tag_id == object_tag.id
