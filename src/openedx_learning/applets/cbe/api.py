@@ -637,6 +637,7 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
         CompetencyCriterion.objects.filter(
             object_tag__object_id__in=list(fraction_by_object_id),
             object_tag__taxonomy__competencytaxonomy__isnull=False,
+            object_tag__archived=False,
             archived=False,
         )
         .select_related("object_tag", "rule_profile")
