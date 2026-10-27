@@ -589,6 +589,8 @@ def tag_object(
     Applying a tag whose object tag is archived restores that same row, and leaves its ``deletion_locked``
     unchanged. Omitted object tags that are deletion-locked are archived instead of deleted. A restored free-text
     value is stored with the newly applied spelling.
+    Omitted object tags that are already hidden, the ones :meth:`ObjectTagQuerySet.unarchived` excludes, are left
+    alone, because a caller that builds its list from the filtered read paths never saw them.
     """
     if not isinstance(tags, list):
         raise ValueError(_("Tags must be a list, not {type}.").format(type=type(tags).__name__))
@@ -654,8 +656,16 @@ def tag_object(
                     )
                     object_tags_to_create.append(object_tag)
 
-    # Whatever is left in `existing_object_tags` was not asked for, so it is removed from the object.
-    _save_object_tags(existing_object_tags, object_tags_to_update, object_tags_to_create)
+    # Whatever is left in `existing_object_tags` was not asked for. A caller builds its list from the filtered read
+    # paths, so a hidden row left unclaimed here was never shown to it. Removing that row would delete or re-archive
+    # something the caller can't see, so only visible rows are removed.
+    visible_pks = set(
+        ObjectTag.objects.filter(pk__in=[object_tag.pk for object_tag in existing_object_tags])
+        .unarchived()
+        .values_list("pk", flat=True)
+    )
+    object_tags_to_remove = [object_tag for object_tag in existing_object_tags if object_tag.pk in visible_pks]
+    _save_object_tags(object_tags_to_remove, object_tags_to_update, object_tags_to_create)
 
 
 def add_tag_to_object(object_id: str, tag: Tag) -> ObjectTag:
