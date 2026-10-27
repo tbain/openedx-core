@@ -1691,7 +1691,7 @@ class TestArchiveLockedObjectTags(TestTagTaxonomyMixin, TestCase):
         if hidden_by == "association":
             ObjectTag.objects.filter(pk=hidden.pk).update(archived=True)
         else:
-            Tag.objects.filter(pk=hidden.tag_id).update(archived=True)
+            Tag.objects.filter(taxonomy=self.taxonomy, value="Mammalia").update(archived=True)
         assert [t.value for t in tagging_api.get_object_tags("obj1")] == ["Fungi"]
 
         self._apply("obj1", ["Archaea"])
