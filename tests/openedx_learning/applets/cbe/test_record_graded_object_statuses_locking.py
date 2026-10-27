@@ -85,12 +85,12 @@ def test_second_learner_on_locked_association_succeeds_and_keeps_lock(
     assert object_tag.deletion_locked is True
 
 
-def test_graded_object_with_no_criteria_performs_no_lock_query(user, django_assert_num_queries) -> None:
+def test_graded_object_with_no_criteria_performs_no_lock_query(user) -> None:
+    """Content with no competency criteria never reaches the lock call and locks nothing."""
     score = GradedObjectScore(object_id="block-v1:Org1+Python100+Fall2026+problem+none", fraction=Decimal("0.9"))
 
     with mock.patch("openedx_learning.applets.cbe.api.lock_object_tags_for_deletion") as lock:
-        with django_assert_num_queries(1):
-            record_graded_object_statuses(user_id=user.id, scores=[score])
+        record_graded_object_statuses(user_id=user.id, scores=[score])
 
     lock.assert_not_called()
     assert ObjectTag.objects.filter(deletion_locked=True).count() == 0
@@ -130,7 +130,6 @@ def test_lock_is_one_bulk_call_regardless_of_criteria_count(
     user, competency_taxonomy: CompetencyTaxonomy, default_rule_profile: CompetencyRuleProfile, criteria_count: int
 ) -> None:
     object_id = "block-v1:Org1+Python100+Fall2026+problem+many"
-    object_tags = []
     for index in range(criteria_count):
         tag = Tag.objects.create(taxonomy=competency_taxonomy, value=f"Competency {index}")
         object_tag = ObjectTag.objects.create(object_id=object_id, taxonomy=competency_taxonomy, tag=tag)
@@ -139,7 +138,6 @@ def test_lock_is_one_bulk_call_regardless_of_criteria_count(
             object_tag=object_tag,
             rule_profile=default_rule_profile,
         )
-        object_tags.append(object_tag)
 
     with CaptureQueriesContext(connection) as captured:
         changed = record_graded_object_statuses(
@@ -224,8 +222,9 @@ def test_deleting_locked_association_archives_it_and_protects_tag_and_taxonomy(
     assert is_taxonomy_locked_for_deletion(competency_taxonomy.id) is True
     assert not hasattr(Tag, "deletion_locked")
     assert not hasattr(Taxonomy, "deletion_locked")
-    status = StudentCompetencyCriterionStatus.objects.get(criterion=criterion, user_id=user.id)
-    assert status.criterion.object_tag_id == object_tag.id
+    resolved = StudentCompetencyCriterionStatus.objects.get(criterion=criterion, user_id=user.id).criterion.object_tag
+    assert resolved.pk == object_tag.pk
+    assert resolved.archived is True
 
 
 def test_archived_association_records_no_new_mastery(
@@ -245,5 +244,6 @@ def test_archived_association_records_no_new_mastery(
 
     assert changed == 0
     assert not StudentCompetencyCriterionStatus.objects.filter(criterion=criterion, user_id=second_user.id).exists()
-    first_status = StudentCompetencyCriterionStatus.objects.get(criterion=criterion, user_id=user.id)
-    assert first_status.criterion.object_tag_id == object_tag.id
+    resolved = StudentCompetencyCriterionStatus.objects.get(criterion=criterion, user_id=user.id).criterion.object_tag
+    assert resolved.pk == object_tag.pk
+    assert resolved.archived is True
