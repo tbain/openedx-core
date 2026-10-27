@@ -1703,7 +1703,6 @@ class TestArchiveLockedObjectTags(TestTagTaxonomyMixin, TestCase):
         assert still_hidden.deletion_locked is False
 
     def test_tag_object_unarchives_unlocked_hidden_association_on_reapply(self) -> None:
-        """Re-applying an archived, unlocked association's own tag un-archives that same row."""
         self._apply("obj1", ["Mammalia"])
         hidden = self._object_tag("obj1", "Mammalia")
         ObjectTag.objects.filter(pk=hidden.pk).update(archived=True)
