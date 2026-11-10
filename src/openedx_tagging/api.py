@@ -314,15 +314,26 @@ def get_object_tag_counts(object_id_pattern: str, count_implicit=False) -> dict[
         return {row["object_id"]: row["num_tags"] for row in qs}
 
 
-def delete_object_tags(object_id: str):
+def delete_object_tags(object_id: str, *, keep_hidden: bool = False) -> None:
     """
-    Delete all ObjectTag entries for a given object.
+    Delete the ObjectTag entries for a given object.
 
-    Locked associations (``deletion_locked=True``) are archived instead of deleted.
+    Locked associations (``deletion_locked=True``) are archived instead of deleted, whatever ``keep_hidden`` is.
+
+    :param object_id: The object whose associations are deleted.
+    :param keep_hidden: If False, all of the object's associations are deleted, including archived ones and ones whose
+        tag or taxonomy is archived. If True, only the associations that :meth:`ObjectTagQuerySet.unarchived` returns
+        are deleted, and the hidden ones are left untouched: they are not deleted, not archived again, and their
+        ``deletion_locked`` value is unchanged.
     """
-    tags = ObjectTag.objects.filter(object_id=object_id)
+    if not keep_hidden:
+        ObjectTag.objects.filter(object_id=object_id).delete()
+        return
 
-    tags.delete()
+    pks = list(ObjectTag.objects.filter(object_id=object_id).unarchived().values_list("pk", flat=True))
+    # Delete by primary key: the queryset delete locks the rows it selects, and unarchived() joins the tag and taxonomy
+    # tables, so deleting the joined queryset would lock shared tag and taxonomy rows on MariaDB.
+    ObjectTag.objects.filter(pk__in=pks).delete()
 
 
 def _check_new_tag_count(
