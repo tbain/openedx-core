@@ -4,7 +4,7 @@ Tagging API Views
 from __future__ import annotations
 
 from django.core import exceptions
-from django.db import models, transaction
+from django.db import models
 from django.http import Http404, HttpResponse
 from rest_framework import mixins, status
 from rest_framework.decorators import action
@@ -20,6 +20,7 @@ from ...api import (
     add_usage_counts,
     create_taxonomy,
     delete_tags_from_taxonomy,
+    delete_taxonomy,
     get_object_tag_counts,
     get_object_tags,
     get_taxonomies,
@@ -31,7 +32,7 @@ from ...api import (
 from ...data import TagDataQuerySet
 from ...import_export.api import export_tags, import_tags
 from ...import_export.parsers import ParserFormat
-from ...models import ObjectTag, Tag, Taxonomy
+from ...models import Tag, Taxonomy
 from ...rules import ObjectTagPermissionItem
 from ..paginators import MAX_FULL_DEPTH_THRESHOLD, DisabledTagsPagination, TagsPagination, TaxonomyPagination
 from ..utils import view_auth_classes
@@ -179,7 +180,7 @@ class TaxonomyView(TaggingExceptionHandlerMixin, ModelViewSet):
     the same as for a taxonomy that is deleted.
 
     **Delete Query Returns**
-        * 200 - Success
+        * 204 - Success
         * 404 - Taxonomy not found
         * 403 - Permission denied
 
@@ -296,19 +297,8 @@ class TaxonomyView(TaggingExceptionHandlerMixin, ModelViewSet):
     def perform_destroy(self, instance: Taxonomy) -> None:
         """
         Delete the taxonomy, or archive it if it has a deletion-locked tag association.
-
-        Archiving does not set ``archived`` on the taxonomy's tags.
         """
-        with transaction.atomic():
-            # Both reads take row locks, since no constraint can express this: a concurrent
-            # lock_object_tags_for_deletion() call, or a new ObjectTag, could otherwise make the taxonomy
-            # depended upon between these reads and the delete.
-            list(Taxonomy.objects.filter(pk=instance.pk).select_for_update().values_list("pk", flat=True))
-            flags = ObjectTag.objects.filter(taxonomy_id=instance.pk).select_deletion_locks_for_update()
-            if any(deletion_locked for _tag_id, deletion_locked in flags):
-                Taxonomy.objects.filter(pk=instance.pk).update(archived=True)
-            else:
-                instance.delete()
+        delete_taxonomy(instance)
 
     def perform_create(self, serializer) -> None:
         """

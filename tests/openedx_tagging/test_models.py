@@ -11,7 +11,7 @@ import ddt  # type: ignore[import]
 import pytest
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.db import connection, models, transaction
+from django.db import connection, transaction
 from django.db.models import F
 from django.db.utils import IntegrityError
 from django.test import override_settings
@@ -20,6 +20,7 @@ from django.test.utils import CaptureQueriesContext
 
 from openedx_tagging import api
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
+from openedx_tagging.models.base import _RemovalTag, _split_archive_and_delete
 from openedx_tagging.models.utils import RESERVED_TAG_CHARS, TAG_EXTERNAL_ID_MAX_LENGTH, tag_external_id_candidate
 from openedx_tagging.signal_handlers import _is_explicit_tag_delete
 from openedx_tagging.tasks import (
@@ -1432,7 +1433,7 @@ class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
         assert ObjectTag.objects.get(pk=locked.pk).archived is True
         assert not ObjectTag.objects.filter(pk=unlocked.pk).exists()
 
-    def test_select_deletion_locks_for_update_returns_flags(self) -> None:
+    def test_deletion_locked_for_update_returns_flags(self) -> None:
         """
         The reader returns each row's tag id and lock flag, including rows that are archived.
         """
@@ -1442,13 +1443,14 @@ class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
         api.tag_object("obj2", self.taxonomy, ["Bacteria"])
 
         with transaction.atomic():
-            free_text = ObjectTag.objects.filter(object_id="obj1").select_deletion_locks_for_update()
-            closed = ObjectTag.objects.filter(object_id="obj2").select_deletion_locks_for_update()
+            free_text = ObjectTag.objects.filter(object_id="obj1").deletion_locked_for_update()
+            closed = ObjectTag.objects.filter(object_id="obj2").deletion_locked_for_update()
 
         assert sorted(free_text, key=lambda row: row[1]) == [(None, False), (None, True)]
         assert closed == [(self.bacteria.pk, False)]
 
 
+@ddt.ddt
 class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
     """
     Test that Taxonomy.delete_tags() archives tags that a deletion-locked association depends on, and deletes the rest.
@@ -1477,14 +1479,6 @@ class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
         object_tag.refresh_from_db()
         assert object_tag.tag_id == dpann.pk
         assert object_tag.taxonomy_id == self.taxonomy.pk
-
-    def test_mixed_bulk_request(self) -> None:
-        self._lock("DPANN")
-
-        self.taxonomy.delete_tags(["DPANN", "Euryarchaeida", "Proteoarchaeota"])
-
-        assert self._existing("DPANN", "Euryarchaeida", "Proteoarchaeota") == {"DPANN"}
-        assert self._archived_values() == {"DPANN"}
 
     def test_unlocked_ancestor_of_locked_tag_is_archived(self) -> None:
         self._lock("Mammalia")
@@ -1535,40 +1529,12 @@ class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
         assert self._archived_values() == {"Eubacteria"}
         assert self._existing("Bacteria", "DPANN") == {"Bacteria", "DPANN"}
 
-    def test_validation_errors_write_nothing(self) -> None:
-        self._lock("DPANN")
-        api.tag_object("free-text-object", self.free_text_taxonomy, ["anything"])
-        tags_before = set(Tag.objects.values_list("pk", "archived"))
-        cases = [
-            (self.free_text_taxonomy, ["anything"], False, "free text taxonomies"),
-            (self.read_only_taxonomy, ["System Tag 1"], False, "read-only taxonomies"),
-            (self.taxonomy, ["DPANN", "No Such Tag"], False, "Invalid tag id provided"),
-            (self.taxonomy, ["Bacteria"], False, "contain children"),
-        ]
-        for taxonomy, tags, with_subtags, message in cases:
-            with pytest.raises(ValueError, match=message):
-                taxonomy.delete_tags(tags, with_subtags)
-            assert set(Tag.objects.values_list("pk", "archived")) == tags_before
-
     def test_empty_request_writes_nothing(self) -> None:
         tags_before = set(Tag.objects.values_list("pk", "archived"))
 
         self.taxonomy.delete_tags([])
 
         assert set(Tag.objects.values_list("pk", "archived")) == tags_before
-
-    def test_archive_query_count_does_not_grow(self) -> None:
-        self._lock("DPANN", "object-1")
-        self._lock("Euryarchaeida", "object-2")
-        self._lock("Proteoarchaeota", "object-3")
-
-        with CaptureQueriesContext(connection) as one_tag:
-            self.taxonomy.delete_tags(["DPANN"])
-        with CaptureQueriesContext(connection) as two_tags:
-            self.taxonomy.delete_tags(["Euryarchaeida", "Proteoarchaeota"])
-
-        assert self._archived_values() == {"DPANN", "Euryarchaeida", "Proteoarchaeota"}
-        assert len(one_tag) == len(two_tags)
 
     @patch("openedx_tagging.signal_handlers.emit_content_object_associations_changed_for_object_ids_task.delay")
     def test_deleted_tag_under_archived_parent_updates_search_index(self, mock_task_delay) -> None:
@@ -1581,14 +1547,55 @@ class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
         notified = {object_id for call in mock_task_delay.call_args_list for object_id in call.kwargs["object_ids"]}
         assert "obj-a" in notified
 
-    def test_row_locks_tags_and_their_associations(self) -> None:
-        """
-        The tags to remove and their associations are selected for update, so that a concurrent tagging or
-        deletion-lock write waits for the delete.
-        """
-        real = models.QuerySet.select_for_update
+    @ddt.data(
+        ("free_text_taxonomy", ["anything"], "free text taxonomies"),
+        ("read_only_taxonomy", ["System Tag 1"], "read-only taxonomies"),
+        ("taxonomy", ["DPANN", "No Such Tag"], "Invalid tag id provided"),
+        ("taxonomy", ["Bacteria"], "contain children"),
+    )
+    @ddt.unpack
+    def test_validation_error_writes_nothing(self, taxonomy_attr: str, tags: list[str], message: str) -> None:
+        self._lock("DPANN")
+        api.tag_object("free-text-object", self.free_text_taxonomy, ["anything"])
+        tags_before = set(Tag.objects.values_list("pk", "archived"))
 
-        with patch.object(models.QuerySet, "select_for_update", autospec=True, side_effect=real) as select_for_update:
-            self.taxonomy.delete_tags(["DPANN"])
+        with pytest.raises(ValueError, match=message):
+            getattr(self, taxonomy_attr).delete_tags(tags)
 
-        assert {call.args[0].model for call in select_for_update.call_args_list} == {Tag, ObjectTag}
+        assert set(Tag.objects.values_list("pk", "archived")) == tags_before
+
+    def test_archive_query_count_does_not_grow(self) -> None:
+        values = ["DPANN", "Euryarchaeida", "Proteoarchaeota", "Eubacteria", "Archaebacteria", "Mammalia"]
+        for index, value in enumerate(values):
+            self._lock(value, f"object-{index}")
+
+        with CaptureQueriesContext(connection) as one_tag:
+            self.taxonomy.delete_tags(values[:1])
+        with CaptureQueriesContext(connection) as five_tags:
+            self.taxonomy.delete_tags(values[1:])
+
+        assert self._archived_values() == set(values)
+        assert len(one_tag) == len(five_tags)
+
+    def test_only_the_top_of_each_deleted_subtree_is_returned(self) -> None:
+        removal = [
+            _RemovalTag(1, None, "A\t"),
+            _RemovalTag(2, 1, "A\tB\t"),
+            _RemovalTag(3, 1, "A\tC\t"),
+            _RemovalTag(4, 3, "A\tC\tD\t"),
+        ]
+
+        assert _split_archive_and_delete(removal, {2}) == ({1, 2}, [3])
+
+    @pytest.mark.skipif(not connection.features.has_select_for_update, reason="The database has no row locks.")
+    def test_row_locks_tags_and_their_associations_before_writing(self) -> None:
+        self._lock("DPANN")
+
+        with CaptureQueriesContext(connection) as queries:
+            self.taxonomy.delete_tags(["DPANN", "Euryarchaeida"])
+
+        statements = [query["sql"] for query in queries]
+        locking = [index for index, sql in enumerate(statements) if "FOR UPDATE" in sql]
+        first_write = next(index for index, sql in enumerate(statements) if sql.startswith(("UPDATE", "DELETE")))
+        assert len(locking) == 2
+        assert max(locking) < first_write

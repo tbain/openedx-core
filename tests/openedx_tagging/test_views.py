@@ -11,7 +11,7 @@ import ddt  # type: ignore[import]
 import rules
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.db import IntegrityError, models
+from django.db import IntegrityError
 from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -643,6 +643,7 @@ class TestTaxonomyViewSet(TestTaxonomyViewMixin):
         if status.is_success(expected_status):
             response = self.client.get(url)
             assert response.status_code == status.HTTP_404_NOT_FOUND
+            assert not Taxonomy.objects.filter(pk=taxonomy.pk).exists()
 
     def test_delete_archived_taxonomy(self):
         """
@@ -679,16 +680,6 @@ class TestTaxonomyViewSet(TestTaxonomyViewMixin):
         object_tag.refresh_from_db()
         assert (object_tag.tag_id, object_tag.taxonomy_id) == (tag_id, taxonomy.pk)
 
-    def test_delete_taxonomy_with_archived_locked_association_archives_it(self):
-        taxonomy, object_tag = self._taxonomy_with_association("archived association", locked=True)
-        ObjectTag.objects.filter(pk=object_tag.pk).update(archived=True)
-
-        self.client.force_authenticate(user=self.staff)
-        response = self.client.delete(TAXONOMY_DETAIL_URL.format(pk=taxonomy.pk))
-
-        assert response.status_code == status.HTTP_204_NO_CONTENT
-        assert Taxonomy.objects.get(pk=taxonomy.pk).archived is True
-
     def test_delete_locked_and_unlocked_taxonomy_respond_the_same(self):
         locked, _ = self._taxonomy_with_association("locked", locked=True)
         unlocked, _ = self._taxonomy_with_association("unlocked", locked=False)
@@ -701,20 +692,6 @@ class TestTaxonomyViewSet(TestTaxonomyViewMixin):
         assert archived.content == deleted.content
         assert Taxonomy.objects.get(pk=locked.pk).archived is True
         assert not Taxonomy.objects.filter(pk=unlocked.pk).exists()
-
-    def test_delete_taxonomy_row_locks_taxonomy_and_its_associations(self):
-        """
-        The taxonomy and its associations are selected for update, so that a concurrent tagging or deletion-lock
-        write waits for the delete.
-        """
-        taxonomy, _object_tag = self._taxonomy_with_association("unlocked", locked=False)
-        real = models.QuerySet.select_for_update
-
-        self.client.force_authenticate(user=self.staff)
-        with patch.object(models.QuerySet, "select_for_update", autospec=True, side_effect=real) as select_for_update:
-            self.client.delete(TAXONOMY_DETAIL_URL.format(pk=taxonomy.pk))
-
-        assert {call.args[0].model for call in select_for_update.call_args_list} == {Taxonomy, ObjectTag}
 
     def test_delete_taxonomy_404(self):
         url = TAXONOMY_DETAIL_URL.format(pk=123123)

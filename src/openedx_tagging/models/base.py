@@ -5,7 +5,7 @@ Tagging app base data models
 from __future__ import annotations
 
 import re
-from typing import ClassVar, List, Self, Sequence, cast
+from typing import ClassVar, List, NamedTuple, Self, Sequence, cast
 
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import NotSupportedError, connections, models, router, transaction
@@ -85,27 +85,14 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
             .exclude(taxonomy__archived=True)
         )
 
-    def _for_update_of_self(self) -> Self:
-        """
-        Mark this queryset to row-lock its own rows, and not joined ones where the database supports that.
-        """
-        # select_for_update() marks the queryset for writing, so only then does .db name the write database,
-        # while still honoring an explicit .using().
-        locking_qs = self.select_for_update()
-        if connections[locking_qs.db].features.has_select_for_update_of:
-            # of=("self",) keeps MySQL and PostgreSQL from also locking the joined Tag and Taxonomy rows, and
-            # MariaDB doesn't support it.
-            locking_qs = locking_qs.select_for_update(of=("self",))
-        return locking_qs
-
-    def select_deletion_locks_for_update(self) -> list[tuple[int | None, bool]]:
+    def deletion_locked_for_update(self) -> list[tuple[int | None, bool]]:
         """
         Row-lock these object tags and return each one's ``(tag_id, deletion_locked)``.
 
         Archived object tags are included, because a locked one still protects its tag and taxonomy.
         Must be called inside ``transaction.atomic()``.
         """
-        return list(self._for_update_of_self().values_list("tag_id", "deletion_locked"))
+        return list(self.select_for_update().values_list("tag_id", "deletion_locked"))
 
     def delete(self) -> tuple[int, dict[str, int]]:
         """
@@ -131,8 +118,14 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
         if getattr(self, "_fields", None) is not None:
             raise TypeError("Cannot call delete() after .values() or .values_list()")
 
-        locking_qs = self._for_update_of_self()
+        # select_for_update() marks the queryset for writing, so only then does .db name the write database,
+        # while still honoring an explicit .using().
+        locking_qs = self.select_for_update()
         db = locking_qs.db
+        if connections[db].features.has_select_for_update_of:
+            # of=("self",) keeps MySQL and PostgreSQL from also locking the joined Tag and Taxonomy rows, and
+            # MariaDB doesn't support it.
+            locking_qs = locking_qs.select_for_update(of=("self",))
         manager = self.model.objects.using(db)
         with transaction.atomic(using=db):
             # Lock every row before reading its flag, so that a concurrent lock_object_tags_for_deletion() call waits
@@ -403,26 +396,31 @@ class TagIsArchived(Tag.DoesNotExist):
 Tag.IsArchived = TagIsArchived
 
 
+class _RemovalTag(NamedTuple):
+    """The columns of a Tag that ``Taxonomy.delete_tags()`` needs to decide between archiving and deleting it."""
+
+    pk: int
+    parent_id: int | None
+    lineage: str
+
+
 def _split_archive_and_delete(
-    removal: Sequence[tuple[int, int | None, str]], locked_ids: set[int | None],
+    removal: Sequence[_RemovalTag], locked_ids: set[int | None],
 ) -> tuple[set[int], list[int]]:
     """
-    Split the tags in ``removal``, given as ``(id, parent_id, lineage)``, into ids to archive and ids to delete.
+    Split the tags in ``removal`` into the ids to archive and the ids at the top of each subtree to delete.
 
-    A tag is archived if it is in ``locked_ids`` or is above a tag that is. Only the top of each deleted subtree is
-    returned, since the cascade from ``Tag.parent`` removes the rest.
+    A tag is archived if it is in ``locked_ids`` or is above a tag that is. Deleting the top of each subtree is
+    enough, since the cascade from ``Tag.parent`` removes the rest.
     """
-    locked_lineages = [lineage for tag_id, _, lineage in removal if tag_id in locked_ids]
-    # A tag's lineage is a prefix of its descendants' lineages, so this is the locked tags and their ancestors.
+    locked_lineages = [tag.lineage for tag in removal if tag.pk in locked_ids]
+    # A tag's lineage is a prefix of its descendants' lineages, so this is the locked tags and those of their
+    # ancestors that are in ``removal``.
     archive_ids = {
-        tag_id
-        for tag_id, _, lineage in removal
-        if any(locked_lineage.startswith(lineage) for locked_lineage in locked_lineages)
+        tag.pk for tag in removal if any(lineage.startswith(tag.lineage) for lineage in locked_lineages)
     }
-    delete_ids = {tag_id for tag_id, _, _ in removal} - archive_ids
-    delete_roots = [
-        tag_id for tag_id, parent_id, _ in removal if tag_id in delete_ids and parent_id not in delete_ids
-    ]
+    delete_ids = {tag.pk for tag in removal} - archive_ids
+    delete_roots = [tag.pk for tag in removal if tag.pk in delete_ids and tag.parent_id not in delete_ids]
     return archive_ids, delete_roots
 
 
@@ -840,18 +838,19 @@ class Taxonomy(models.Model):
             )
 
         with transaction.atomic():
-            # Both reads take row locks, since no constraint can express this: a concurrent
-            # lock_object_tags_for_deletion() call, or a new ObjectTag or sub-tag, could otherwise make a tag
-            # depended upon between these reads and the delete.
+            # Row locks are the last resort here. What decides the outcome is a flag that another transaction sets
+            # on ObjectTag rows, which no constraint on Tag can see, and the write being guarded is a cascading
+            # delete, which a conditional update can't stand in for. The Tag locks make a new ObjectTag or sub-tag
+            # under these tags wait, and the ObjectTag locks make lock_object_tags_for_deletion() wait.
 
             # Archived sub-tags are included even without `with_subtags`, because deleting their parent cascades.
-            removal = list(
-                self.tag_set.filter(in_requested_subtrees)
+            removal = [
+                _RemovalTag(*row)
+                for row in self.tag_set.filter(in_requested_subtrees)
                 .select_for_update()
                 .values_list("id", "parent_id", "lineage")
-            )
-            removal_ids = [tag_id for tag_id, _, _ in removal]
-            flags = ObjectTag.objects.filter(tag_id__in=removal_ids).select_deletion_locks_for_update()
+            ]
+            flags = ObjectTag.objects.filter(tag_id__in=[tag.pk for tag in removal]).deletion_locked_for_update()
             locked_ids = {tag_id for tag_id, deletion_locked in flags if deletion_locked}
             archive_ids, delete_roots = _split_archive_and_delete(removal, locked_ids)
             if archive_ids:
