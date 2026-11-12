@@ -11,11 +11,12 @@ import ddt  # type: ignore[import]
 import pytest
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import connection, models, transaction
 from django.db.models import F
 from django.db.utils import IntegrityError
 from django.test import override_settings
 from django.test.testcases import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from openedx_tagging import api
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
@@ -1430,3 +1431,164 @@ class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
         assert result == (2, {ObjectTag._meta.label: 2})
         assert ObjectTag.objects.get(pk=locked.pk).archived is True
         assert not ObjectTag.objects.filter(pk=unlocked.pk).exists()
+
+    def test_select_deletion_locks_for_update_returns_flags(self) -> None:
+        """
+        The reader returns each row's tag id and lock flag, including rows that are archived.
+        """
+        locked = self._object_tag("obj1", "locked", locked=True)
+        ObjectTag.objects.filter(pk=locked.pk).update(archived=True)
+        self._object_tag("obj1", "unlocked")
+        api.tag_object("obj2", self.taxonomy, ["Bacteria"])
+
+        with transaction.atomic():
+            free_text = ObjectTag.objects.filter(object_id="obj1").select_deletion_locks_for_update()
+            closed = ObjectTag.objects.filter(object_id="obj2").select_deletion_locks_for_update()
+
+        assert sorted(free_text, key=lambda row: row[1]) == [(None, False), (None, True)]
+        assert closed == [(self.bacteria.pk, False)]
+
+
+class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
+    """
+    Test that Taxonomy.delete_tags() archives tags that a deletion-locked association depends on, and deletes the rest.
+    """
+
+    def _lock(self, value: str, object_id: str = "locked-object") -> ObjectTag:
+        """Tag `object_id` with the tag `value` and lock that association against deletion."""
+        api.tag_object(object_id, self.taxonomy, [value])
+        object_tag = ObjectTag.objects.get(object_id=object_id, tag__value=value)
+        api.lock_object_tags_for_deletion(object_tag.pk)
+        return object_tag
+
+    def _archived_values(self) -> set[str]:
+        return set(self.taxonomy.tag_set.filter(archived=True).values_list("value", flat=True))
+
+    def _existing(self, *values: str) -> set[str]:
+        return set(self.taxonomy.tag_set.filter(value__in=values).values_list("value", flat=True))
+
+    def test_locked_tag_is_archived(self) -> None:
+        object_tag = self._lock("DPANN")
+        dpann = get_tag("DPANN")
+
+        self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._archived_values() == {"DPANN"}
+        object_tag.refresh_from_db()
+        assert object_tag.tag_id == dpann.pk
+        assert object_tag.taxonomy_id == self.taxonomy.pk
+
+    def test_mixed_bulk_request(self) -> None:
+        self._lock("DPANN")
+
+        self.taxonomy.delete_tags(["DPANN", "Euryarchaeida", "Proteoarchaeota"])
+
+        assert self._existing("DPANN", "Euryarchaeida", "Proteoarchaeota") == {"DPANN"}
+        assert self._archived_values() == {"DPANN"}
+
+    def test_unlocked_ancestor_of_locked_tag_is_archived(self) -> None:
+        self._lock("Mammalia")
+
+        self.taxonomy.delete_tags(["Eukaryota"], with_subtags=True)
+
+        assert self._archived_values() == {"Eukaryota", "Animalia", "Chordata", "Mammalia"}
+        assert self._existing("Plantae", "Fungi", "Protista", "Monera", "Arthropoda") == set()
+
+    def test_unlocked_subtree_is_fully_deleted(self) -> None:
+        lineage = get_tag("Eukaryota").lineage
+
+        self.taxonomy.delete_tags(["Eukaryota"], with_subtags=True)
+
+        assert not self.taxonomy.tag_set.filter(lineage__startswith=lineage).exists()
+
+    def test_archived_locked_association_still_archives_tag(self) -> None:
+        object_tag = self._lock("DPANN")
+        ObjectTag.objects.filter(pk=object_tag.pk).update(archived=True)
+
+        self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._archived_values() == {"DPANN"}
+
+    def test_parent_with_only_archived_children_needs_no_flag(self) -> None:
+        self._lock("Eubacteria")
+        self.taxonomy.delete_tags(["Eubacteria", "Archaebacteria"])
+
+        self.taxonomy.delete_tags(["Bacteria"])
+
+        assert self._archived_values() == {"Bacteria", "Eubacteria"}
+        assert self._existing("Archaebacteria") == set()
+
+    def test_unarchived_tag_beneath_archived_child_still_needs_flag(self) -> None:
+        """
+        The `with_subtags` check looks at every level, so an unarchived tag below an archived child still counts.
+        """
+        self._lock("Eubacteria")
+        self.taxonomy.delete_tags(["Eubacteria", "Archaebacteria"])
+        # A tag import can move an unarchived tag under an archived one.
+        dpann = get_tag("DPANN")
+        dpann.parent = get_tag("Eubacteria")
+        dpann.save()
+
+        with pytest.raises(ValueError, match="contain children"):
+            self.taxonomy.delete_tags(["Bacteria"])
+
+        assert self._archived_values() == {"Eubacteria"}
+        assert self._existing("Bacteria", "DPANN") == {"Bacteria", "DPANN"}
+
+    def test_validation_errors_write_nothing(self) -> None:
+        self._lock("DPANN")
+        api.tag_object("free-text-object", self.free_text_taxonomy, ["anything"])
+        tags_before = set(Tag.objects.values_list("pk", "archived"))
+        cases = [
+            (self.free_text_taxonomy, ["anything"], False, "free text taxonomies"),
+            (self.read_only_taxonomy, ["System Tag 1"], False, "read-only taxonomies"),
+            (self.taxonomy, ["DPANN", "No Such Tag"], False, "Invalid tag id provided"),
+            (self.taxonomy, ["Bacteria"], False, "contain children"),
+        ]
+        for taxonomy, tags, with_subtags, message in cases:
+            with pytest.raises(ValueError, match=message):
+                taxonomy.delete_tags(tags, with_subtags)
+            assert set(Tag.objects.values_list("pk", "archived")) == tags_before
+
+    def test_empty_request_writes_nothing(self) -> None:
+        tags_before = set(Tag.objects.values_list("pk", "archived"))
+
+        self.taxonomy.delete_tags([])
+
+        assert set(Tag.objects.values_list("pk", "archived")) == tags_before
+
+    def test_archive_query_count_does_not_grow(self) -> None:
+        self._lock("DPANN", "object-1")
+        self._lock("Euryarchaeida", "object-2")
+        self._lock("Proteoarchaeota", "object-3")
+
+        with CaptureQueriesContext(connection) as one_tag:
+            self.taxonomy.delete_tags(["DPANN"])
+        with CaptureQueriesContext(connection) as two_tags:
+            self.taxonomy.delete_tags(["Euryarchaeida", "Proteoarchaeota"])
+
+        assert self._archived_values() == {"DPANN", "Euryarchaeida", "Proteoarchaeota"}
+        assert len(one_tag) == len(two_tags)
+
+    @patch("openedx_tagging.signal_handlers.emit_content_object_associations_changed_for_object_ids_task.delay")
+    def test_deleted_tag_under_archived_parent_updates_search_index(self, mock_task_delay) -> None:
+        api.tag_object("obj-a", self.taxonomy, ["Arthropoda"])
+        self._lock("Mammalia")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.taxonomy.delete_tags(["Animalia"], with_subtags=True)
+
+        notified = {object_id for call in mock_task_delay.call_args_list for object_id in call.kwargs["object_ids"]}
+        assert "obj-a" in notified
+
+    def test_row_locks_tags_and_their_associations(self) -> None:
+        """
+        The tags to remove and their associations are selected for update, so that a concurrent tagging or
+        deletion-lock write waits for the delete.
+        """
+        real = models.QuerySet.select_for_update
+
+        with patch.object(models.QuerySet, "select_for_update", autospec=True, side_effect=real) as select_for_update:
+            self.taxonomy.delete_tags(["DPANN"])
+
+        assert {call.args[0].model for call in select_for_update.call_args_list} == {Tag, ObjectTag}
