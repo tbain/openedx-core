@@ -15,11 +15,13 @@ from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
 from ...api import (
+    ConcurrentDeleteError,
     TagDoesNotExist,
     add_tag_to_taxonomy,
     add_usage_counts,
     create_taxonomy,
     delete_tags_from_taxonomy,
+    delete_taxonomy,
     get_object_tag_counts,
     get_object_tags,
     get_taxonomies,
@@ -35,7 +37,7 @@ from ...models import Tag, Taxonomy
 from ...rules import ObjectTagPermissionItem
 from ..paginators import MAX_FULL_DEPTH_THRESHOLD, DisabledTagsPagination, TagsPagination, TaxonomyPagination
 from ..utils import view_auth_classes
-from .exception_handlers import TaggingExceptionHandlerMixin
+from .exception_handlers import ConcurrentDeleteConflict, TaggingExceptionHandlerMixin
 from .permissions import ObjectTagObjectPermissions, TaxonomyObjectPermissions, TaxonomyTagsObjectPermissions
 from .serializers import (
     ObjectTagListQueryParamsSerializer,
@@ -175,8 +177,11 @@ class TaxonomyView(TaggingExceptionHandlerMixin, ModelViewSet):
     **Delete Example Requests**
         DELETE api/tagging/v1/taxonomy/:pk         - Delete a taxonomy
 
+    A taxonomy that has a deletion-locked tag association is archived and stays in the database. The response is
+    the same as for a taxonomy that is deleted.
+
     **Delete Query Returns**
-        * 200 - Success
+        * 204 - Success
         * 404 - Taxonomy not found
         * 403 - Permission denied
 
@@ -240,7 +245,7 @@ class TaxonomyView(TaggingExceptionHandlerMixin, ModelViewSet):
     pagination_class = TaxonomyPagination
 
     # Actions for which `get_object` also resolves archived taxonomies. Writes reject them with a 400, and
-    # destroy keeps its existing behavior.
+    # destroy archives or deletes them as it does any other taxonomy.
     ACTIONS_THAT_RESOLVE_ARCHIVED = ("update", "partial_update", "destroy", "update_import", "plan_update_import")
 
     def get_object(self) -> Taxonomy:
@@ -249,7 +254,7 @@ class TaxonomyView(TaggingExceptionHandlerMixin, ModelViewSet):
         permissions.
 
         Archived taxonomies are not found, except for the write and delete actions, which resolve them so that
-        the write can be rejected with an explanation and destroy keeps its behavior for archived taxonomies.
+        the write can be rejected with an explanation and destroy treats them like any other taxonomy.
         """
         pk = int(self.kwargs["pk"])
         if self.action in self.ACTIONS_THAT_RESOLVE_ARCHIVED:
@@ -289,6 +294,12 @@ class TaxonomyView(TaggingExceptionHandlerMixin, ModelViewSet):
         qs = get_taxonomies(enabled)
         qs = qs.annotate(tags_count=models.Count("tag", filter=models.Q(tag__archived=False), distinct=True))
         return qs
+
+    def perform_destroy(self, instance: Taxonomy) -> None:
+        """
+        Delete the taxonomy, or archive it if it has a deletion-locked tag association.
+        """
+        delete_taxonomy(instance)
 
     def perform_create(self, serializer) -> None:
         """
@@ -802,8 +813,11 @@ class TaxonomyTagsView(TaggingExceptionHandlerMixin, ListAPIView, RetrieveUpdate
         * tags (required): The values (identifiers) of Tags that should be
                            deleted from Taxonomy
         * with_subtags (optional): If a Tag in the provided ids contains
-                                   children (subtags), deletion will fail unless
-                                   set to `True`. Defaults to `False`.
+                                   unarchived children (subtags), deletion will
+                                   fail unless set to `True`. Defaults to `False`.
+
+    A Tag that has a deletion-locked tag association, or a subtag that does, is archived and stays in the
+    database. The response is the same as for Tags that are deleted.
 
     **Delete Example Requests**
         DELETE api/tagging/v1/taxonomy/:id/tags                                     - Delete Tag(s) in Taxonomy
@@ -817,6 +831,7 @@ class TaxonomyTagsView(TaggingExceptionHandlerMixin, ListAPIView, RetrieveUpdate
         * 400 - Invalid parameters provided
         * 403 - Permission denied
         * 404 - Taxonomy not found
+        * 409 - The tags were being changed by other requests. Try again.
 
     """
 
@@ -992,8 +1007,8 @@ class TaxonomyTagsView(TaggingExceptionHandlerMixin, ListAPIView, RetrieveUpdate
 
     def delete(self, request, *args, **kwargs):
         """
-        Deletes Tag(s) in Taxonomy. If any of the Tags have children and
-        the `with_subtags` is not set to `True` it will fail, otherwise
+        Deletes Tag(s) in Taxonomy. If any of the Tags have unarchived children
+        and the `with_subtags` is not set to `True` it will fail, otherwise
         the sub-tags will be deleted as well.
         """
         taxonomy = self.get_taxonomy()
@@ -1009,5 +1024,7 @@ class TaxonomyTagsView(TaggingExceptionHandlerMixin, ListAPIView, RetrieveUpdate
             delete_tags_from_taxonomy(taxonomy, tags, with_subtags)
         except ValueError as e:
             raise ValidationError(e) from e
+        except ConcurrentDeleteError as e:
+            raise ConcurrentDeleteConflict() from e
 
         return Response(status=status.HTTP_200_OK)

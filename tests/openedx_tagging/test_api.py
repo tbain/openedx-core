@@ -9,7 +9,7 @@ from unittest.mock import patch
 import ddt  # type: ignore[import]
 import pytest
 from django.core.exceptions import ValidationError
-from django.db import connection
+from django.db import IntegrityError, connection
 from django.db.models import QuerySet
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
@@ -18,7 +18,7 @@ import openedx_tagging.api as tagging_api
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
 
 from .test_models import TestTagTaxonomyMixin, get_tag
-from .utils import pretty_format_tags
+from .utils import concurrent_write, pretty_format_tags
 
 tag_values_for_autocomplete_test = [
     'Archaea',
@@ -1408,6 +1408,105 @@ class TestDeletionLock(TestTagTaxonomyMixin, TestCase):
             with pytest.raises(ObjectTag.DoesNotExist, match=str(object_tag.pk)):
                 tagging_api.lock_object_tags_for_deletion(object_tag.pk)
 
+    @ddt.data(
+        ("taxonomy", "Mammalia", Tag),
+        ("taxonomy", "Mammalia", Taxonomy),
+        ("free_text_taxonomy", "anything", Taxonomy),
+    )
+    @ddt.unpack
+    def test_lock_refuses_association_orphaned_before_the_write(
+        self, taxonomy_attr: str, value: str, deleted_model: type[Tag] | type[Taxonomy],
+    ) -> None:
+        """
+        A tag or taxonomy delete that commits while the lock waits leaves the association pointing at nothing,
+        so the lock is refused.
+        """
+        taxonomy = getattr(self, taxonomy_attr)
+        object_tag = self._tag("obj1", value, taxonomy=taxonomy)
+        real_update = QuerySet.update
+
+        def delete_then_update(queryset: QuerySet[Any], **kwargs: Any) -> int:
+            # The delete runs updates of its own, so only the lock's update triggers it.
+            if "deletion_locked" in kwargs:
+                with patch.object(QuerySet, "update", real_update):
+                    deleted_model.objects.filter(objecttag=object_tag).delete()
+            return real_update(queryset, **kwargs)
+
+        with patch.object(QuerySet, "update", delete_then_update):
+            with pytest.raises(ObjectTag.DoesNotExist, match=str(object_tag.pk)):
+                tagging_api.lock_object_tags_for_deletion(object_tag.pk)
+        assert not self._is_locked(object_tag)
+
+    def test_lock_accepts_association_repaired_before_the_write(self) -> None:
+        """
+        An association whose missing tag is filled in while the lock waits has lost nothing, so it is locked.
+        """
+        tagging_api.tag_object("obj1", self.taxonomy, ["Ghost"], create_invalid=True)
+        object_tag = ObjectTag.objects.get(object_id="obj1")
+        assert object_tag.tag_id is None
+        real_update = QuerySet.update
+
+        def repair_then_update(queryset: QuerySet[Any], **kwargs: Any) -> int:
+            if "deletion_locked" in kwargs:
+                with patch.object(QuerySet, "update", real_update):
+                    tagging_api.add_tag_to_taxonomy(self.taxonomy, "Ghost")
+                    tagging_api.resync_object_tags(ObjectTag.objects.filter(pk=object_tag.pk))
+            return real_update(queryset, **kwargs)
+
+        with patch.object(QuerySet, "update", repair_then_update):
+            tagging_api.lock_object_tags_for_deletion(object_tag.pk)
+
+        object_tag.refresh_from_db()
+        assert object_tag.tag_id is not None
+        assert object_tag.deletion_locked
+
+    def test_lock_accepts_association_that_already_had_no_taxonomy(self) -> None:
+        object_tag = self._tag("obj1")
+        Taxonomy.objects.filter(pk=self.taxonomy.pk).delete()
+
+        tagging_api.lock_object_tags_for_deletion(object_tag.pk)
+
+        assert self._is_locked(object_tag)
+
+    def test_resync_keeps_a_lock_set_after_the_row_was_loaded(self) -> None:
+        object_tag = self._tag("obj1")
+        ObjectTag.objects.filter(pk=object_tag.pk).update(_value="stale value")
+        loaded = ObjectTag.objects.filter(pk=object_tag.pk).select_related("tag", "taxonomy")
+        assert len(loaded) == 1  # Evaluate it, so the resync works on rows read before the lock
+        tagging_api.lock_object_tags_for_deletion(object_tag.pk)
+
+        assert tagging_api.resync_object_tags(loaded) == 1
+
+        assert self._is_locked(object_tag)
+        # The stored column is read, since ObjectTag.value prefers the tag's own value.
+        assert ObjectTag.objects.filter(pk=object_tag.pk).values_list("_value", flat=True).get() == "Mammalia"
+
+    def test_resync_saves_a_changed_export_id(self) -> None:
+        object_tag = self._tag("obj1")
+        Taxonomy.objects.filter(pk=self.taxonomy.pk).update(export_id="renamed-export-id")
+
+        assert tagging_api.resync_object_tags(ObjectTag.objects.filter(pk=object_tag.pk)) == 1
+
+        # The stored column is read, since ObjectTag.export_id prefers the taxonomy's own export id.
+        stored = ObjectTag.objects.filter(pk=object_tag.pk).values_list("_export_id", flat=True).get()
+        assert stored == "renamed-export-id"
+
+    def test_tag_object_keeps_a_lock_set_after_the_row_was_loaded(self) -> None:
+        object_tag = self._tag("obj1")
+        ObjectTag.objects.filter(pk=object_tag.pk).update(_value="stale value")
+        real_full_clean = ObjectTag.full_clean
+
+        def lock_then_clean(instance: ObjectTag, *args: Any, **kwargs: Any) -> None:
+            # tag_object() validates each row it read earlier just before saving it.
+            tagging_api.lock_object_tags_for_deletion(object_tag.pk)
+            real_full_clean(instance, *args, **kwargs)
+
+        with patch.object(ObjectTag, "full_clean", lock_then_clean):
+            tagging_api.tag_object("obj1", self.taxonomy, ["Mammalia"])
+
+        assert self._is_locked(object_tag)
+        assert ObjectTag.objects.get(pk=object_tag.pk).value == "Mammalia"
+
     def test_lock_tolerates_a_concurrent_lock(self) -> None:
         object_tag = self._tag("obj1")
         real_update = QuerySet.update
@@ -1741,3 +1840,104 @@ class TestArchiveLockedObjectTags(TestTagTaxonomyMixin, TestCase):
                 self._locked(object_id, value, self.free_text_taxonomy)
             counts.append(self._query_count(self._apply, object_id, [], self.free_text_taxonomy))
         assert counts[0] == counts[1]
+
+
+class TestDeleteTaxonomy(TestTagTaxonomyMixin, TestCase):
+    """
+    Test that delete_taxonomy() archives a taxonomy that a deletion-locked association depends on.
+    """
+
+    def _association(self, locked: bool) -> ObjectTag:
+        """Tag an object with a tag from `self.taxonomy`, and lock that association if `locked`."""
+        tagging_api.tag_object("obj1", self.taxonomy, ["Mammalia"])
+        object_tag = ObjectTag.objects.get(object_id="obj1", taxonomy=self.taxonomy)
+        if locked:
+            tagging_api.lock_object_tags_for_deletion(object_tag.pk)
+        return object_tag
+
+    def test_locked_taxonomy_is_archived(self) -> None:
+        object_tag = self._association(locked=True)
+        tag_ids = set(self.taxonomy.tag_set.values_list("pk", flat=True))
+
+        tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert self.taxonomy.archived is True
+        assert Taxonomy.objects.get(pk=self.taxonomy.pk).archived is True
+        assert set(Tag.objects.filter(taxonomy=self.taxonomy, archived=False).values_list("pk", flat=True)) == tag_ids
+        object_tag.refresh_from_db()
+        assert (object_tag.tag_id, object_tag.taxonomy_id) == (self.mammalia.pk, self.taxonomy.pk)
+
+    def test_unlocked_taxonomy_is_deleted(self) -> None:
+        self._association(locked=False)
+
+        tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert not Taxonomy.objects.filter(pk=self.taxonomy.pk).exists()
+
+    def test_archived_locked_association_still_archives_taxonomy(self) -> None:
+        object_tag = self._association(locked=True)
+        ObjectTag.objects.filter(pk=object_tag.pk).update(archived=True)
+
+        tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert Taxonomy.objects.get(pk=self.taxonomy.pk).archived is True
+
+    def test_lock_that_appears_after_the_first_check_still_archives(self) -> None:
+        """
+        A deletion lock that the first check missed is seen by the check made just before deleting.
+        """
+        self._association(locked=True)
+        tagging_api.tag_object("obj2", self.taxonomy, ["Bacteria"])
+
+        with patch.object(tagging_api, "is_taxonomy_locked_for_deletion", return_value=False):
+            tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert Taxonomy.objects.get(pk=self.taxonomy.pk).archived is True
+        assert ObjectTag.objects.get(object_id="obj2").taxonomy_id == self.taxonomy.pk
+
+    def test_delete_is_tried_again_after_the_database_refuses_it_once(self) -> None:
+        self._association(locked=False)
+        real_delete = QuerySet.delete
+        refusals = [IntegrityError("foreign key")]
+
+        def refuse_once_then_delete(queryset: QuerySet[Any]) -> tuple[int, dict[str, int]]:
+            if queryset.model is Taxonomy and refusals:
+                raise refusals.pop()
+            return real_delete(queryset)
+
+        with patch.object(QuerySet, "delete", refuse_once_then_delete):
+            tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert not Taxonomy.objects.filter(pk=self.taxonomy.pk).exists()
+
+    def test_database_refusal_on_every_attempt_is_raised_as_it_is(self) -> None:
+        self._association(locked=False)
+
+        with patch.object(QuerySet, "delete", side_effect=IntegrityError("foreign key")):
+            with pytest.raises(IntegrityError, match="foreign key"):
+                tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert ObjectTag.objects.get(object_id="obj1").taxonomy_id == self.taxonomy.pk
+
+    def test_association_added_and_locked_during_the_delete_archives_the_taxonomy(self) -> None:
+        """
+        An association that another transaction adds and deletion-locks while the taxonomy is being deleted keeps
+        its tag and taxonomy, and the taxonomy is archived.
+        """
+        def add_locked_association() -> None:
+            tagging_api.tag_object("late", self.taxonomy, ["Mammalia"])
+            tagging_api.lock_object_tags_for_deletion(ObjectTag.objects.get(object_id="late").pk)
+
+        with concurrent_write(Taxonomy, add_locked_association):
+            tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert Taxonomy.objects.get(pk=self.taxonomy.pk).archived is True
+        late = ObjectTag.objects.get(object_id="late")
+        assert (late.tag_id, late.taxonomy_id) == (self.mammalia.pk, self.taxonomy.pk)
+
+    def test_unlocked_association_added_during_the_delete_does_not_archive(self) -> None:
+        with concurrent_write(Taxonomy, lambda: tagging_api.tag_object("late", self.taxonomy, ["Mammalia"])):
+            tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert not Taxonomy.objects.filter(pk=self.taxonomy.pk).exists()
+        assert ObjectTag.objects.get(object_id="late").taxonomy_id is None

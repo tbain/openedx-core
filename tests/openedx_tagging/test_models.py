@@ -11,14 +11,15 @@ import ddt  # type: ignore[import]
 import pytest
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.db import transaction
-from django.db.models import F
+from django.db import connection, transaction
+from django.db.models import F, ProtectedError, QuerySet
 from django.db.utils import IntegrityError
 from django.test import override_settings
 from django.test.testcases import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from openedx_tagging import api
-from openedx_tagging.models import ObjectTag, Tag, Taxonomy
+from openedx_tagging.models import ConcurrentDeleteError, ObjectTag, Tag, Taxonomy
 from openedx_tagging.models.utils import RESERVED_TAG_CHARS, TAG_EXTERNAL_ID_MAX_LENGTH, tag_external_id_candidate
 from openedx_tagging.signal_handlers import _is_explicit_tag_delete
 from openedx_tagging.tasks import (
@@ -26,7 +27,7 @@ from openedx_tagging.tasks import (
     emit_content_object_associations_changed_for_tag_task,
 )
 
-from .utils import pretty_format_tags
+from .utils import concurrent_write, pretty_format_tags
 
 
 def get_tag(value):
@@ -1430,3 +1431,238 @@ class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
         assert result == (2, {ObjectTag._meta.label: 2})
         assert ObjectTag.objects.get(pk=locked.pk).archived is True
         assert not ObjectTag.objects.filter(pk=unlocked.pk).exists()
+
+
+@ddt.ddt
+class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
+    """
+    Test that Taxonomy.delete_tags() archives tags that a deletion-locked association depends on, and deletes the rest.
+    """
+
+    def _lock(self, value: str, object_id: str = "locked-object") -> ObjectTag:
+        """Tag `object_id` with the tag `value` and lock that association against deletion."""
+        api.tag_object(object_id, self.taxonomy, [value])
+        object_tag = ObjectTag.objects.get(object_id=object_id, tag__value=value)
+        api.lock_object_tags_for_deletion(object_tag.pk)
+        return object_tag
+
+    def _archived_values(self) -> set[str]:
+        return set(self.taxonomy.tag_set.filter(archived=True).values_list("value", flat=True))
+
+    def _existing(self, *values: str) -> set[str]:
+        return set(self.taxonomy.tag_set.filter(value__in=values).values_list("value", flat=True))
+
+    def test_locked_tag_is_archived(self) -> None:
+        object_tag = self._lock("DPANN")
+        dpann = get_tag("DPANN")
+
+        self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._archived_values() == {"DPANN"}
+        object_tag.refresh_from_db()
+        assert object_tag.tag_id == dpann.pk
+        assert object_tag.taxonomy_id == self.taxonomy.pk
+
+    def test_unlocked_ancestor_of_locked_tag_is_archived(self) -> None:
+        self._lock("Mammalia")
+
+        self.taxonomy.delete_tags(["Eukaryota"], with_subtags=True)
+
+        assert self._archived_values() == {"Eukaryota", "Animalia", "Chordata", "Mammalia"}
+        assert self._existing("Plantae", "Fungi", "Protista", "Monera", "Arthropoda") == set()
+
+    def test_unlocked_subtree_is_fully_deleted(self) -> None:
+        self.taxonomy.delete_tags(["Eukaryota"], with_subtags=True)
+
+        assert self._existing("Eukaryota", "Animalia", "Plantae", "Chordata", "Arthropoda", "Mammalia") == set()
+        assert self._existing("Bacteria", "Archaea") == {"Bacteria", "Archaea"}
+
+    def test_archived_locked_association_still_archives_tag(self) -> None:
+        object_tag = self._lock("DPANN")
+        ObjectTag.objects.filter(pk=object_tag.pk).update(archived=True)
+
+        self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._archived_values() == {"DPANN"}
+
+    def test_parent_with_only_archived_children_needs_no_flag(self) -> None:
+        self._lock("Eubacteria")
+        self.taxonomy.delete_tags(["Eubacteria", "Archaebacteria"])
+
+        self.taxonomy.delete_tags(["Bacteria"])
+
+        assert self._archived_values() == {"Bacteria", "Eubacteria"}
+        assert self._existing("Archaebacteria") == set()
+
+    def test_unarchived_tag_beneath_archived_child_still_needs_flag(self) -> None:
+        """
+        The `with_subtags` check looks at every level, so an unarchived tag below an archived child still counts.
+        """
+        self._lock("Eubacteria")
+        self.taxonomy.delete_tags(["Eubacteria", "Archaebacteria"])
+        # A tag import can move an unarchived tag under an archived one.
+        dpann = get_tag("DPANN")
+        dpann.parent = get_tag("Eubacteria")
+        dpann.save()
+
+        with pytest.raises(ValueError, match="contain children"):
+            self.taxonomy.delete_tags(["Bacteria"])
+
+        assert self._archived_values() == {"Eubacteria"}
+        assert self._existing("Bacteria", "DPANN") == {"Bacteria", "DPANN"}
+
+    def test_empty_request_writes_nothing(self) -> None:
+        tags_before = set(Tag.objects.values_list("pk", "archived"))
+
+        self.taxonomy.delete_tags([])
+
+        assert set(Tag.objects.values_list("pk", "archived")) == tags_before
+
+    @patch("openedx_tagging.signal_handlers.emit_content_object_associations_changed_for_object_ids_task.delay")
+    def test_deleted_tag_under_archived_parent_updates_search_index(self, mock_task_delay) -> None:
+        api.tag_object("obj-a", self.taxonomy, ["Arthropoda"])
+        self._lock("Mammalia")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.taxonomy.delete_tags(["Animalia"], with_subtags=True)
+
+        notified = {object_id for call in mock_task_delay.call_args_list for object_id in call.kwargs["object_ids"]}
+        assert "obj-a" in notified
+
+    @ddt.data(
+        ("free_text_taxonomy", ["anything"], "free text taxonomies"),
+        ("read_only_taxonomy", ["System Tag 1"], "read-only taxonomies"),
+        ("taxonomy", ["DPANN", "No Such Tag"], "Invalid tag id provided"),
+        ("taxonomy", ["Bacteria"], "contain children"),
+    )
+    @ddt.unpack
+    def test_validation_error_writes_nothing(self, taxonomy_attr: str, tags: list[str], message: str) -> None:
+        self._lock("DPANN")
+        api.tag_object("free-text-object", self.free_text_taxonomy, ["anything"])
+        tags_before = set(Tag.objects.values_list("pk", "archived"))
+
+        with pytest.raises(ValueError, match=message):
+            getattr(self, taxonomy_attr).delete_tags(tags)
+
+        assert set(Tag.objects.values_list("pk", "archived")) == tags_before
+
+    def test_archive_query_count_does_not_grow(self) -> None:
+        values = ["DPANN", "Euryarchaeida", "Proteoarchaeota", "Eubacteria", "Archaebacteria", "Mammalia"]
+        for index, value in enumerate(values):
+            self._lock(value, f"object-{index}")
+
+        with CaptureQueriesContext(connection) as one_tag:
+            self.taxonomy.delete_tags(values[:1])
+        with CaptureQueriesContext(connection) as five_tags:
+            self.taxonomy.delete_tags(values[1:])
+
+        assert self._archived_values() == set(values)
+        assert len(one_tag) == len(five_tags)
+
+    def test_locked_sub_tag_with_stale_lineage_is_not_cascaded(self) -> None:
+        """
+        A sub-tag is found through its parent, as the cascade finds it, even if its lineage is out of date.
+        """
+        self._lock("Eubacteria")
+        Tag.objects.filter(pk=self.eubacteria.pk).update(lineage="Renamed\tEubacteria\t")
+
+        self.taxonomy.delete_tags(["Bacteria"], with_subtags=True)
+
+        assert self._archived_values() == {"Bacteria", "Eubacteria"}
+        assert self._existing("Archaebacteria") == set()
+
+    def test_more_tags_than_one_statement_can_join_with_or(self) -> None:
+        taxonomy = api.create_taxonomy("Large")
+        values = [f"tag {index}" for index in range(1100)]
+        Tag.objects.bulk_create(
+            Tag(taxonomy=taxonomy, value=value, external_id=value, lineage=f"{value}\t") for value in values
+        )
+
+        taxonomy.delete_tags(values)
+
+        assert not taxonomy.tag_set.exists()
+
+    def test_lock_set_after_the_read_archives_on_the_next_attempt(self) -> None:
+        api.tag_object("obj", self.taxonomy, ["DPANN"])
+        object_tag = ObjectTag.objects.get(object_id="obj")
+        dpann = get_tag("DPANN")
+
+        with concurrent_write(Tag, lambda: ObjectTag.objects.filter(pk=object_tag.pk).update(deletion_locked=True)):
+            self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._archived_values() == {"DPANN"}
+        assert ObjectTag.objects.get(pk=object_tag.pk).tag_id == dpann.pk
+
+    def test_sub_tag_added_after_the_read_is_not_cascaded(self) -> None:
+        dpann = get_tag("DPANN")
+
+        def add_sub_tag() -> None:
+            Tag.objects.get_or_create(taxonomy=self.taxonomy, value="Kid", parent=dpann)
+
+        with concurrent_write(Tag, add_sub_tag):
+            with pytest.raises(ValueError, match="contain children"):
+                self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._existing("DPANN", "Kid") == {"DPANN", "Kid"}
+
+    def test_concurrent_writes_on_every_attempt_end_in_a_conflict_error(self) -> None:
+        """
+        A delete that concurrent writes keep getting in the way of ends in its own error, not a database one.
+        """
+        dpann = get_tag("DPANN")
+        kids: list[Tag] = []
+
+        def add_another_sub_tag() -> None:
+            kids.append(Tag.objects.create(taxonomy=self.taxonomy, value=f"Kid {len(kids)}", parent=dpann))
+
+        with concurrent_write(Tag, add_another_sub_tag):
+            with pytest.raises(ConcurrentDeleteError):
+                self.taxonomy.delete_tags(["DPANN"], with_subtags=True)
+
+        assert self._existing("DPANN") == {"DPANN"}
+
+    def test_database_refusal_on_every_attempt_is_raised_as_it_is(self) -> None:
+        with patch.object(QuerySet, "delete", side_effect=IntegrityError("foreign key")):
+            with pytest.raises(IntegrityError, match="foreign key"):
+                self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._existing("DPANN") == {"DPANN"}
+
+    def test_locked_association_that_already_had_no_tag_does_not_block_deletes(self) -> None:
+        """
+        A deletion-locked association with no tag that was there before the delete is not mistaken for one the
+        delete orphaned.
+        """
+        api.tag_object("unresolved", self.taxonomy, ["Ghost"], create_invalid=True)
+        unresolved = ObjectTag.objects.get(object_id="unresolved")
+        assert unresolved.tag_id is None
+        api.lock_object_tags_for_deletion(unresolved.pk)
+
+        self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._existing("DPANN") == set()
+
+    def test_rename_keeps_an_archive_made_after_the_tag_was_read(self) -> None:
+        """
+        update_tag() saves only what a rename changes, so it can't write a stale `archived=False` back.
+        """
+        dpann = get_tag("DPANN")
+        real_clean = Tag.clean
+
+        def archive_then_clean(tag: Tag) -> None:
+            # Tag.save() calls clean() first, after update_tag() has read the tag.
+            Tag.objects.filter(pk=dpann.pk).update(archived=True)
+            real_clean(tag)
+
+        with patch.object(Tag, "clean", archive_then_clean):
+            self.taxonomy.update_tag("DPANN", "Renamed")
+
+        dpann.refresh_from_db()
+        assert (dpann.value, dpann.archived) == ("Renamed", True)
+
+    def test_protected_tag_is_not_retried(self) -> None:
+        with patch.object(QuerySet, "delete", side_effect=ProtectedError("protected", set())) as delete:
+            with pytest.raises(ProtectedError):
+                self.taxonomy.delete_tags(["DPANN"])
+
+        delete.assert_called_once()

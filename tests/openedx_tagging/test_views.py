@@ -19,7 +19,7 @@ from rest_framework.test import APITestCase
 from openedx_tagging import api
 from openedx_tagging.import_export import api as import_export_api
 from openedx_tagging.import_export.parsers import ParserFormat
-from openedx_tagging.models import ObjectTag, Tag, Taxonomy
+from openedx_tagging.models import ConcurrentDeleteError, ObjectTag, Tag, Taxonomy
 from openedx_tagging.rest_api.paginators import TagsPagination
 from openedx_tagging.rules import can_change_object_tag_objectid, can_view_object_tag_objectid
 
@@ -643,10 +643,11 @@ class TestTaxonomyViewSet(TestTaxonomyViewMixin):
         if status.is_success(expected_status):
             response = self.client.get(url)
             assert response.status_code == status.HTTP_404_NOT_FOUND
+            assert not Taxonomy.objects.filter(pk=taxonomy.pk).exists()
 
     def test_delete_archived_taxonomy(self):
         """
-        Deleting an archived taxonomy still works. Archived deletion rules are owned by a separate ticket (#780).
+        Deleting an archived taxonomy that has no deletion-locked association removes it.
         """
         taxonomy = api.create_taxonomy(name="Archived taxonomy")
         Taxonomy.objects.filter(pk=taxonomy.pk).update(archived=True)
@@ -655,6 +656,29 @@ class TestTaxonomyViewSet(TestTaxonomyViewMixin):
         response = self.client.delete(TAXONOMY_DETAIL_URL.format(pk=taxonomy.pk))
         assert response.status_code == status.HTTP_204_NO_CONTENT
         assert not Taxonomy.objects.filter(pk=taxonomy.pk).exists()
+
+    def _taxonomy_with_association(self, name: str, locked: bool) -> tuple[Taxonomy, ObjectTag]:
+        """Create a taxonomy with one tag applied to one object, and lock that association if `locked`."""
+        taxonomy = api.create_taxonomy(name=name)
+        api.add_tag_to_taxonomy(taxonomy, "tag")
+        api.tag_object(f"object-for-{taxonomy.pk}", taxonomy, ["tag"])
+        object_tag = ObjectTag.objects.get(taxonomy=taxonomy)
+        if locked:
+            api.lock_object_tags_for_deletion(object_tag.pk)
+        return taxonomy, object_tag
+
+    def test_delete_locked_and_unlocked_taxonomy_respond_the_same(self):
+        locked, _ = self._taxonomy_with_association("locked", locked=True)
+        unlocked, _ = self._taxonomy_with_association("unlocked", locked=False)
+
+        self.client.force_authenticate(user=self.staff)
+        archived = self.client.delete(TAXONOMY_DETAIL_URL.format(pk=locked.pk))
+        deleted = self.client.delete(TAXONOMY_DETAIL_URL.format(pk=unlocked.pk))
+
+        assert archived.status_code == deleted.status_code == status.HTTP_204_NO_CONTENT
+        assert archived.content == deleted.content
+        assert Taxonomy.objects.get(pk=locked.pk).archived is True
+        assert not Taxonomy.objects.filter(pk=unlocked.pk).exists()
 
     def test_delete_taxonomy_404(self):
         url = TAXONOMY_DETAIL_URL.format(pk=123123)
@@ -2801,6 +2825,51 @@ class TestTaxonomyTagsView(TestTaxonomyViewMixin):
         for existing_tag in existing_tags:
             with self.assertRaises(Tag.DoesNotExist):
                 existing_tag.refresh_from_db()
+
+    def _lock_tag(self, value: str, object_id: str = "locked-object") -> None:
+        """Tag `object_id` with the small taxonomy's tag `value` and lock that association against deletion."""
+        api.tag_object(object_id, self.small_taxonomy, [value])
+        object_tag = ObjectTag.objects.get(object_id=object_id, tag__value=value)
+        api.lock_object_tags_for_deletion(object_tag.pk)
+
+    def test_delete_mixed_tags_reports_success_once(self):
+        self._lock_tag("DPANN")
+        self.client.force_authenticate(user=self.staff)
+
+        response = self.client.delete(
+            self.small_taxonomy_url,
+            {"tags": ["DPANN", "Euryarchaeida", "Proteoarchaeota"], "with_subtags": True},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        remaining = Tag.objects.filter(
+            taxonomy=self.small_taxonomy, value__in=["DPANN", "Euryarchaeida", "Proteoarchaeota"],
+        )
+        assert list(remaining.values_list("value", "archived")) == [("DPANN", True)]
+
+    def test_delete_locked_and_unlocked_tag_respond_the_same(self):
+        self._lock_tag("DPANN")
+        api.tag_object("unlocked-object", self.small_taxonomy, ["Euryarchaeida"])
+        self.client.force_authenticate(user=self.staff)
+
+        archived = self.client.delete(self.small_taxonomy_url, {"tags": ["DPANN"]}, format="json")
+        deleted = self.client.delete(self.small_taxonomy_url, {"tags": ["Euryarchaeida"]}, format="json")
+
+        assert archived.status_code == deleted.status_code == status.HTTP_200_OK
+        assert archived.content == deleted.content
+        assert Tag.objects.get(taxonomy=self.small_taxonomy, value="DPANN").archived is True
+        assert not Tag.objects.filter(taxonomy=self.small_taxonomy, value="Euryarchaeida").exists()
+
+    def test_delete_tags_that_keep_changing_is_a_conflict(self):
+        self.client.force_authenticate(user=self.staff)
+
+        with patch(
+            "openedx_tagging.rest_api.v1.views.delete_tags_from_taxonomy", side_effect=ConcurrentDeleteError("busy"),
+        ):
+            response = self.client.delete(self.small_taxonomy_url, {"tags": ["DPANN"]}, format="json")
+
+        assert response.status_code == status.HTTP_409_CONFLICT
 
     def test_delete_tag_with_subtags_should_fail_without_flag_passed(self):
         self.client.force_authenticate(user=self.staff)

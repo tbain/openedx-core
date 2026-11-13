@@ -15,6 +15,16 @@ from rest_framework.views import exception_handler
 log = logging.getLogger(__name__)
 
 
+class ConcurrentDeleteConflict(APIException):
+    """
+    A tag delete gave up because other requests kept changing the same tags. It can be sent again.
+    """
+
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "The delete could not be completed because the same records were being changed. Try again."
+    default_code = "conflict"
+
+
 def _custom_exception_handler(exc: Exception, context: dict) -> Response | None:
     """
     Return standard DRF errors for APIException and a generic 500 otherwise.
