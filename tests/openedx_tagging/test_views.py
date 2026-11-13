@@ -19,7 +19,7 @@ from rest_framework.test import APITestCase
 from openedx_tagging import api
 from openedx_tagging.import_export import api as import_export_api
 from openedx_tagging.import_export.parsers import ParserFormat
-from openedx_tagging.models import ObjectTag, Tag, Taxonomy
+from openedx_tagging.models import ConcurrentDeleteError, ObjectTag, Tag, Taxonomy
 from openedx_tagging.rest_api.paginators import TagsPagination
 from openedx_tagging.rules import can_change_object_tag_objectid, can_view_object_tag_objectid
 
@@ -666,19 +666,6 @@ class TestTaxonomyViewSet(TestTaxonomyViewMixin):
         if locked:
             api.lock_object_tags_for_deletion(object_tag.pk)
         return taxonomy, object_tag
-
-    def test_delete_locked_taxonomy_archives_it(self):
-        taxonomy, object_tag = self._taxonomy_with_association("locked", locked=True)
-        tag_id = object_tag.tag_id
-
-        self.client.force_authenticate(user=self.staff)
-        response = self.client.delete(TAXONOMY_DETAIL_URL.format(pk=taxonomy.pk))
-
-        assert response.status_code == status.HTTP_204_NO_CONTENT
-        assert Taxonomy.objects.get(pk=taxonomy.pk).archived is True
-        assert list(Tag.objects.filter(taxonomy=taxonomy).values_list("pk", "archived")) == [(tag_id, False)]
-        object_tag.refresh_from_db()
-        assert (object_tag.tag_id, object_tag.taxonomy_id) == (tag_id, taxonomy.pk)
 
     def test_delete_locked_and_unlocked_taxonomy_respond_the_same(self):
         locked, _ = self._taxonomy_with_association("locked", locked=True)
@@ -2863,6 +2850,7 @@ class TestTaxonomyTagsView(TestTaxonomyViewMixin):
 
     def test_delete_locked_and_unlocked_tag_respond_the_same(self):
         self._lock_tag("DPANN")
+        api.tag_object("unlocked-object", self.small_taxonomy, ["Euryarchaeida"])
         self.client.force_authenticate(user=self.staff)
 
         archived = self.client.delete(self.small_taxonomy_url, {"tags": ["DPANN"]}, format="json")
@@ -2872,6 +2860,16 @@ class TestTaxonomyTagsView(TestTaxonomyViewMixin):
         assert archived.content == deleted.content
         assert Tag.objects.get(taxonomy=self.small_taxonomy, value="DPANN").archived is True
         assert not Tag.objects.filter(taxonomy=self.small_taxonomy, value="Euryarchaeida").exists()
+
+    def test_delete_tags_that_keep_changing_is_a_conflict(self):
+        self.client.force_authenticate(user=self.staff)
+
+        with patch(
+            "openedx_tagging.rest_api.v1.views.delete_tags_from_taxonomy", side_effect=ConcurrentDeleteError("busy"),
+        ):
+            response = self.client.delete(self.small_taxonomy_url, {"tags": ["DPANN"]}, format="json")
+
+        assert response.status_code == status.HTTP_409_CONFLICT
 
     def test_delete_tag_with_subtags_should_fail_without_flag_passed(self):
         self.client.force_authenticate(user=self.staff)

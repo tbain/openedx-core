@@ -32,11 +32,11 @@ from ...api import (
 from ...data import TagDataQuerySet
 from ...import_export.api import export_tags, import_tags
 from ...import_export.parsers import ParserFormat
-from ...models import Tag, Taxonomy
+from ...models import ConcurrentDeleteError, Tag, Taxonomy
 from ...rules import ObjectTagPermissionItem
 from ..paginators import MAX_FULL_DEPTH_THRESHOLD, DisabledTagsPagination, TagsPagination, TaxonomyPagination
 from ..utils import view_auth_classes
-from .exception_handlers import TaggingExceptionHandlerMixin
+from .exception_handlers import ConcurrentDeleteConflict, TaggingExceptionHandlerMixin
 from .permissions import ObjectTagObjectPermissions, TaxonomyObjectPermissions, TaxonomyTagsObjectPermissions
 from .serializers import (
     ObjectTagListQueryParamsSerializer,
@@ -830,6 +830,7 @@ class TaxonomyTagsView(TaggingExceptionHandlerMixin, ListAPIView, RetrieveUpdate
         * 400 - Invalid parameters provided
         * 403 - Permission denied
         * 404 - Taxonomy not found
+        * 409 - The tags were being changed by other requests. Try again.
 
     """
 
@@ -1008,8 +1009,6 @@ class TaxonomyTagsView(TaggingExceptionHandlerMixin, ListAPIView, RetrieveUpdate
         Deletes Tag(s) in Taxonomy. If any of the Tags have unarchived children
         and the `with_subtags` is not set to `True` it will fail, otherwise
         the sub-tags will be deleted as well.
-
-        Tags that a deletion-locked tag association depends on are archived instead, with the same response.
         """
         taxonomy = self.get_taxonomy()
 
@@ -1024,5 +1023,7 @@ class TaxonomyTagsView(TaggingExceptionHandlerMixin, ListAPIView, RetrieveUpdate
             delete_tags_from_taxonomy(taxonomy, tags, with_subtags)
         except ValueError as e:
             raise ValidationError(e) from e
+        except ConcurrentDeleteError as e:
+            raise ConcurrentDeleteConflict() from e
 
         return Response(status=status.HTTP_200_OK)

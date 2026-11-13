@@ -25,6 +25,7 @@ from django.utils.translation import gettext as _
 
 from .data import TagDataQuerySet
 from .models import ObjectTag, Tag, Taxonomy
+from .models.base import retry_on_concurrent_write
 
 # Export this as part of the API
 TagDoesNotExist = Tag.DoesNotExist
@@ -210,7 +211,9 @@ def resync_object_tags(object_tags: QuerySet | None = None) -> int:
     for object_tag in object_tags:
         changed = object_tag.resync()
         if changed:
-            object_tag.save()
+            # Only the columns resync() can change are written, so that a deletion lock set since this row was
+            # read isn't overwritten with the stale value.
+            object_tag.save(update_fields=["taxonomy", "tag", "_value", "_export_id"])
             num_changed += 1
 
     return num_changed
@@ -432,7 +435,12 @@ def _save_object_tags(removed: list[ObjectTag], unarchive_pks: list[int], update
             ObjectTag.objects.filter(pk__in=unarchive_pks).update(archived=False)
         for object_tag in updated:
             object_tag.full_clean()  # Run validation
-            object_tag.save()
+            if object_tag.pk:
+                # An existing row only ever has its cached value corrected here. Writing just that column keeps
+                # a deletion lock set since the row was read from being overwritten with the stale value.
+                object_tag.save(update_fields=["_value"])
+            else:
+                object_tag.save()
 
 
 def tag_object(
@@ -572,11 +580,12 @@ def delete_tags_from_taxonomy(
     with_subtags: bool
 ):
     """
-    Delete Tags that belong to a Taxonomy, along with their sub-tags.
+    Delete Tags that belong to a Taxonomy. With `with_subtags`, their sub-tags are deleted as well.
 
     A tag is archived instead if it, or any tag beneath it, has a deletion-locked association (``ObjectTag``).
 
-    Fails if any of the tags have unarchived sub-tags, at any depth, and `with_subtags` is not `True`.
+    Fails if any of the tags have unarchived sub-tags, at any depth, and `with_subtags` is not `True`. Raises
+    ConcurrentDeleteError if tags or deletion locks kept being added beneath these tags on every attempt.
     """
     taxonomy.delete_tags(tags, with_subtags)
 
@@ -585,23 +594,41 @@ def delete_taxonomy(taxonomy: Taxonomy) -> None:
     """
     Delete the taxonomy, or archive it if any of its associations (``ObjectTag``) is deletion-locked.
 
-    An archived taxonomy stays in the database, and ``taxonomy.archived`` is set to match. Archiving does not set
-    ``archived`` on the taxonomy's tags.
+    An archived taxonomy stays in the database, and ``taxonomy.archived`` is set to match on the instance passed
+    in. Archiving does not set ``archived`` on the taxonomy's tags. Calling ``taxonomy.delete()`` directly skips
+    this rule.
+
+    :param taxonomy: The taxonomy to delete or archive.
+    :raises ProtectedError: If the taxonomy has no deletion-locked association but another model still protects
+        one of its tags from deletion.
+    :raises IntegrityError: If the database refused every attempt to delete the taxonomy.
     """
-    # A deletion lock is permanent, so a locked association found here settles it without any row lock.
+    # Seeing a deletion-locked association is enough to archive, which is the safe outcome. Not seeing one isn't
+    # enough to delete, so the delete checks again once it has written.
     if not is_taxonomy_locked_for_deletion(taxonomy.pk):
-        with transaction.atomic():
-            # Row locks are the last resort here. What decides the outcome is a flag that another transaction sets
-            # on ObjectTag rows, which no constraint on Taxonomy can see, and the write being guarded is a
-            # cascading delete, which a conditional update can't stand in for. The Taxonomy lock makes a new
-            # ObjectTag in it wait, and the ObjectTag locks make lock_object_tags_for_deletion() wait.
-            list(Taxonomy.objects.filter(pk=taxonomy.pk).select_for_update().values_list("pk", flat=True))
-            flags = ObjectTag.objects.filter(taxonomy_id=taxonomy.pk).deletion_locked_for_update()
-            if not any(deletion_locked for _tag_id, deletion_locked in flags):
-                taxonomy.delete()
-                return
+        if retry_on_concurrent_write(lambda: _delete_taxonomy_unless_locked(taxonomy)):
+            return
     Taxonomy.objects.filter(pk=taxonomy.pk).update(archived=True)
     taxonomy.archived = True
+
+
+def _delete_taxonomy_unless_locked(taxonomy: Taxonomy) -> bool:
+    """
+    Delete the taxonomy and return True, unless one of its associations is deletion-locked. Needs a transaction.
+
+    Nothing is row-locked before the writes. The associations that aren't deletion-locked are unlinked from the
+    taxonomy first, which is what deleting it does to them anyway. A concurrent ``lock_object_tags_for_deletion()``
+    call either locks its association before that update, which then leaves it linked, or waits for this
+    transaction. Any association still linked afterwards is therefore deletion-locked, and the unlinking is
+    rolled back.
+    """
+    object_tags = ObjectTag.objects.filter(taxonomy_id=taxonomy.pk)
+    object_tags.filter(deletion_locked=False).update(taxonomy=None)
+    if object_tags.exists():
+        transaction.set_rollback(True)
+        return False
+    taxonomy.delete()
+    return True
 
 
 def copy_tags(source_object_id: str, dest_object_id: str):
@@ -667,6 +694,17 @@ def _extract_object_tag_ids(object_tag_ids: int | Iterable[int]) -> set[int]:
     return ids
 
 
+def _lost_tag_or_taxonomy(before: ObjectTag, after: ObjectTag) -> bool:
+    """
+    Return whether an ObjectTag had a tag or a taxonomy in ``before`` that it no longer has in ``after``.
+
+    A tag or taxonomy that was missing and has been filled in is a repair, so it doesn't count.
+    """
+    lost_tag = before.tag_id is not None and after.tag_id is None
+    lost_taxonomy = before.taxonomy_id is not None and after.taxonomy_id is None
+    return lost_tag or lost_taxonomy
+
+
 def lock_object_tags_for_deletion(object_tag_ids: int | Iterable[int]) -> None:
     """
     Lock the given ObjectTags against deletion.
@@ -682,31 +720,22 @@ def lock_object_tags_for_deletion(object_tag_ids: int | Iterable[int]) -> None:
     ids = _extract_object_tag_ids(object_tag_ids)
     if not ids:
         return
-    before = {
-        pk: (locked, tag_id, taxonomy_id)
-        for pk, locked, tag_id, taxonomy_id in ObjectTag.objects.filter(pk__in=ids).values_list(
-            "pk", "deletion_locked", "tag_id", "taxonomy_id"
-        )
-    }
+    before = ObjectTag.objects.only("deletion_locked", "tag", "taxonomy").in_bulk(ids)
     missing = ids - before.keys()
     if missing:
         raise ObjectTag.DoesNotExist(f"ObjectTag ids not found: {sorted(missing)}")
-    unlocked = [object_tag_id for object_tag_id, (locked, _, _) in before.items() if not locked]
+    unlocked = [pk for pk, object_tag in before.items() if not object_tag.deletion_locked]
     if unlocked:
         with transaction.atomic():
             # This update waits for a concurrent delete of the row, its tag, or its taxonomy to finish, so what
             # that delete did is read afterwards. Another caller locking the row first is not an error.
             ObjectTag.objects.filter(pk__in=unlocked, deletion_locked=False).update(deletion_locked=True)
-            after = {
-                pk: (tag_id, taxonomy_id)
-                for pk, tag_id, taxonomy_id in ObjectTag.objects.filter(pk__in=unlocked).values_list(
-                    "pk", "tag_id", "taxonomy_id"
-                )
-            }
+            after = ObjectTag.objects.only("tag", "taxonomy").in_bulk(unlocked)
+
             deleted = set(unlocked) - after.keys()
             if deleted:
                 raise ObjectTag.DoesNotExist(f"ObjectTag ids deleted before they could be locked: {sorted(deleted)}")
-            orphaned = [pk for pk in unlocked if after[pk] != before[pk][1:]]
+            orphaned = [pk for pk in unlocked if _lost_tag_or_taxonomy(before[pk], after[pk])]
             if orphaned:
                 raise ObjectTag.DoesNotExist(
                     f"ObjectTag ids whose tag or taxonomy was deleted before they could be locked: {sorted(orphaned)}"

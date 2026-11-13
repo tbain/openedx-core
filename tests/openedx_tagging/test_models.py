@@ -4,6 +4,8 @@ Test the tagging base models
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -12,15 +14,14 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import connection, transaction
-from django.db.models import F
+from django.db.models import F, ProtectedError, QuerySet
 from django.db.utils import IntegrityError
 from django.test import override_settings
 from django.test.testcases import TestCase
 from django.test.utils import CaptureQueriesContext
 
 from openedx_tagging import api
-from openedx_tagging.models import ObjectTag, Tag, Taxonomy
-from openedx_tagging.models.base import _RemovalTag, _split_archive_and_delete
+from openedx_tagging.models import ConcurrentDeleteError, ObjectTag, Tag, Taxonomy
 from openedx_tagging.models.utils import RESERVED_TAG_CHARS, TAG_EXTERNAL_ID_MAX_LENGTH, tag_external_id_candidate
 from openedx_tagging.signal_handlers import _is_explicit_tag_delete
 from openedx_tagging.tasks import (
@@ -1433,22 +1434,6 @@ class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
         assert ObjectTag.objects.get(pk=locked.pk).archived is True
         assert not ObjectTag.objects.filter(pk=unlocked.pk).exists()
 
-    def test_deletion_locked_for_update_returns_flags(self) -> None:
-        """
-        The reader returns each row's tag id and lock flag, including rows that are archived.
-        """
-        locked = self._object_tag("obj1", "locked", locked=True)
-        ObjectTag.objects.filter(pk=locked.pk).update(archived=True)
-        self._object_tag("obj1", "unlocked")
-        api.tag_object("obj2", self.taxonomy, ["Bacteria"])
-
-        with transaction.atomic():
-            free_text = ObjectTag.objects.filter(object_id="obj1").deletion_locked_for_update()
-            closed = ObjectTag.objects.filter(object_id="obj2").deletion_locked_for_update()
-
-        assert sorted(free_text, key=lambda row: row[1]) == [(None, False), (None, True)]
-        assert closed == [(self.bacteria.pk, False)]
-
 
 @ddt.ddt
 class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
@@ -1489,11 +1474,10 @@ class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
         assert self._existing("Plantae", "Fungi", "Protista", "Monera", "Arthropoda") == set()
 
     def test_unlocked_subtree_is_fully_deleted(self) -> None:
-        lineage = get_tag("Eukaryota").lineage
-
         self.taxonomy.delete_tags(["Eukaryota"], with_subtags=True)
 
-        assert not self.taxonomy.tag_set.filter(lineage__startswith=lineage).exists()
+        assert self._existing("Eukaryota", "Animalia", "Plantae", "Chordata", "Arthropoda", "Mammalia") == set()
+        assert self._existing("Bacteria", "Archaea") == {"Bacteria", "Archaea"}
 
     def test_archived_locked_association_still_archives_tag(self) -> None:
         object_tag = self._lock("DPANN")
@@ -1577,25 +1561,111 @@ class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
         assert self._archived_values() == set(values)
         assert len(one_tag) == len(five_tags)
 
-    def test_only_the_top_of_each_deleted_subtree_is_returned(self) -> None:
-        removal = [
-            _RemovalTag(1, None, "A\t"),
-            _RemovalTag(2, 1, "A\tB\t"),
-            _RemovalTag(3, 1, "A\tC\t"),
-            _RemovalTag(4, 3, "A\tC\tD\t"),
-        ]
+    def test_locked_sub_tag_with_stale_lineage_is_not_cascaded(self) -> None:
+        """
+        A sub-tag is found through its parent, as the cascade finds it, even if its lineage is out of date.
+        """
+        self._lock("Eubacteria")
+        Tag.objects.filter(pk=self.eubacteria.pk).update(lineage="Renamed\tEubacteria\t")
 
-        assert _split_archive_and_delete(removal, {2}) == ({1, 2}, [3])
+        self.taxonomy.delete_tags(["Bacteria"], with_subtags=True)
 
-    @pytest.mark.skipif(not connection.features.has_select_for_update, reason="The database has no row locks.")
-    def test_row_locks_tags_and_their_associations_before_writing(self) -> None:
-        self._lock("DPANN")
+        assert self._archived_values() == {"Bacteria", "Eubacteria"}
+        assert self._existing("Archaebacteria") == set()
 
-        with CaptureQueriesContext(connection) as queries:
-            self.taxonomy.delete_tags(["DPANN", "Euryarchaeida"])
+    def test_more_tags_than_one_statement_can_join_with_or(self) -> None:
+        taxonomy = api.create_taxonomy("Large")
+        values = [f"tag {index}" for index in range(1100)]
+        Tag.objects.bulk_create(
+            Tag(taxonomy=taxonomy, value=value, external_id=value, lineage=f"{value}\t") for value in values
+        )
 
-        statements = [query["sql"] for query in queries]
-        locking = [index for index, sql in enumerate(statements) if "FOR UPDATE" in sql]
-        first_write = next(index for index, sql in enumerate(statements) if sql.startswith(("UPDATE", "DELETE")))
-        assert len(locking) == 2
-        assert max(locking) < first_write
+        taxonomy.delete_tags(values)
+
+        assert not taxonomy.tag_set.exists()
+
+    @contextmanager
+    def _concurrent_write(self, write: Callable[[], object]) -> Iterator[list[int]]:
+        """
+        Make `write` look like another transaction committing between delete_tags() reading and deleting.
+
+        `write` runs just before each tag delete, and again after each rollback, because a rollback here would
+        otherwise undo it, which it could not do to another transaction's commit. Yields the list of tag delete
+        attempts, one entry per attempt.
+        """
+        real_delete = QuerySet.delete
+        real_rollback = connection.savepoint_rollback
+        attempts: list[int] = []
+
+        def write_then_delete(queryset: QuerySet[Any]) -> tuple[int, dict[str, int]]:
+            if queryset.model is Tag:
+                attempts.append(len(attempts) + 1)
+                with patch.object(QuerySet, "delete", real_delete):
+                    write()
+            return real_delete(queryset)
+
+        def rollback_then_write(sid: str) -> None:
+            real_rollback(sid)
+            write()
+
+        with patch.object(QuerySet, "delete", write_then_delete):
+            with patch.object(connection, "savepoint_rollback", rollback_then_write):
+                yield attempts
+
+    def test_lock_set_after_the_read_archives_on_the_next_attempt(self) -> None:
+        api.tag_object("obj", self.taxonomy, ["DPANN"])
+        object_tag = ObjectTag.objects.get(object_id="obj")
+        dpann = get_tag("DPANN")
+
+        with self._concurrent_write(
+            lambda: ObjectTag.objects.filter(pk=object_tag.pk).update(deletion_locked=True)
+        ) as attempts:
+            self.taxonomy.delete_tags(["DPANN"])
+
+        assert attempts == [1]
+        assert self._archived_values() == {"DPANN"}
+        assert ObjectTag.objects.get(pk=object_tag.pk).tag_id == dpann.pk
+
+    def test_sub_tag_added_after_the_read_is_not_cascaded(self) -> None:
+        dpann = get_tag("DPANN")
+
+        with self._concurrent_write(
+            lambda: Tag.objects.get_or_create(taxonomy=self.taxonomy, value="Kid", parent=dpann)
+        ) as attempts:
+            with pytest.raises(ValueError, match="contain children"):
+                self.taxonomy.delete_tags(["DPANN"])
+
+        assert attempts == [1]
+        assert self._existing("DPANN", "Kid") == {"DPANN", "Kid"}
+
+    def test_gives_up_after_three_attempts(self) -> None:
+        """
+        A delete that concurrent writes keep getting in the way of ends in its own error, not a database one.
+        """
+        dpann = get_tag("DPANN")
+        kids: list[Tag] = []
+
+        def add_another_sub_tag() -> None:
+            kids.append(Tag.objects.create(taxonomy=self.taxonomy, value=f"Kid {len(kids)}", parent=dpann))
+
+        with self._concurrent_write(add_another_sub_tag) as attempts:
+            with pytest.raises(ConcurrentDeleteError):
+                self.taxonomy.delete_tags(["DPANN"], with_subtags=True)
+
+        assert attempts == [1, 2, 3]
+        assert self._existing("DPANN") == {"DPANN"}
+
+    def test_database_refusal_is_retried_then_raised_as_it_is(self) -> None:
+        with patch.object(QuerySet, "delete", side_effect=IntegrityError("foreign key")) as delete:
+            with pytest.raises(IntegrityError, match="foreign key"):
+                self.taxonomy.delete_tags(["DPANN"])
+
+        assert delete.call_count == 3
+        assert self._existing("DPANN") == {"DPANN"}
+
+    def test_protected_tag_is_not_retried(self) -> None:
+        with patch.object(QuerySet, "delete", side_effect=ProtectedError("protected", set())) as delete:
+            with pytest.raises(ProtectedError):
+                self.taxonomy.delete_tags(["DPANN"])
+
+        assert delete.call_count == 1
