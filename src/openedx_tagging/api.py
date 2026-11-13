@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable
 from enum import Enum
+from functools import partial
 from typing import Any, Counter, cast
 
 from django.db import models, router, transaction
@@ -25,11 +26,13 @@ from django.utils.translation import gettext as _
 
 from .data import TagDataQuerySet
 from .models import ObjectTag, Tag, Taxonomy
-from .models.base import retry_on_concurrent_write
+from .models.base import ConcurrentDeleteError as _ConcurrentDeleteError
+from .models.base import _ConcurrentWrite, _retry_on_concurrent_write
 
 # Export this as part of the API
 TagDoesNotExist = Tag.DoesNotExist
 ObjectTagDoesNotExist = ObjectTag.DoesNotExist
+ConcurrentDeleteError = _ConcurrentDeleteError
 
 # Maximum number of tags allowed on any one object
 OBJECT_MAX_TAGS = 100
@@ -580,12 +583,9 @@ def delete_tags_from_taxonomy(
     with_subtags: bool
 ):
     """
-    Delete Tags that belong to a Taxonomy. With `with_subtags`, their sub-tags are deleted as well.
+    Delete Tags that belong to a Taxonomy, or archive the ones a deletion-locked association depends on.
 
-    A tag is archived instead if it, or any tag beneath it, has a deletion-locked association (``ObjectTag``).
-
-    Fails if any of the tags have unarchived sub-tags, at any depth, and `with_subtags` is not `True`. Raises
-    ConcurrentDeleteError if tags or deletion locks kept being added beneath these tags on every attempt.
+    See ``Taxonomy.delete_tags()`` for the rule and the errors raised.
     """
     taxonomy.delete_tags(tags, with_subtags)
 
@@ -603,31 +603,34 @@ def delete_taxonomy(taxonomy: Taxonomy) -> None:
         one of its tags from deletion.
     :raises IntegrityError: If the database refused every attempt to delete the taxonomy.
     """
-    # Seeing a deletion-locked association is enough to archive, which is the safe outcome. Not seeing one isn't
-    # enough to delete, so the delete checks again once it has written.
-    if not is_taxonomy_locked_for_deletion(taxonomy.pk):
-        if retry_on_concurrent_write(lambda: _delete_taxonomy_unless_locked(taxonomy)):
+    taxonomy_id = taxonomy.pk
+    # This first check only saves work when the taxonomy is already known to be locked. The check that decides
+    # is the one each delete attempt makes.
+    if not is_taxonomy_locked_for_deletion(taxonomy_id):
+        if _retry_on_concurrent_write(partial(_delete_taxonomy_unless_locked, taxonomy_id)):
             return
-    Taxonomy.objects.filter(pk=taxonomy.pk).update(archived=True)
+    Taxonomy.objects.filter(pk=taxonomy_id).update(archived=True)
     taxonomy.archived = True
 
 
-def _delete_taxonomy_unless_locked(taxonomy: Taxonomy) -> bool:
+def _delete_taxonomy_unless_locked(taxonomy_id: int) -> bool:
     """
-    Delete the taxonomy and return True, unless one of its associations is deletion-locked. Needs a transaction.
+    Make one attempt to delete the taxonomy. Return False, deleting nothing, if it has a deletion-locked association.
 
-    Nothing is row-locked before the writes. The associations that aren't deletion-locked are unlinked from the
-    taxonomy first, which is what deleting it does to them anyway. A concurrent ``lock_object_tags_for_deletion()``
-    call either locks its association before that update, which then leaves it linked, or waits for this
-    transaction. Any association still linked afterwards is therefore deletion-locked, and the unlinking is
-    rolled back.
+    Needs a transaction. The check after the delete catches an association that another transaction
+    deletion-locked, or added and deletion-locked, after the first read. It raises so that this attempt is
+    rolled back, and the next attempt then sees the lock.
     """
-    object_tags = ObjectTag.objects.filter(taxonomy_id=taxonomy.pk)
-    object_tags.filter(deletion_locked=False).update(taxonomy=None)
-    if object_tags.exists():
-        transaction.set_rollback(True)
+    if ObjectTag.objects.filter(taxonomy_id=taxonomy_id, deletion_locked=True).exists():
         return False
-    taxonomy.delete()
+    # Deleting a taxonomy clears the taxonomy of its associations. A deletion-locked association that has no
+    # taxonomy after the delete, and had one before, is one this delete should have archived for.
+    orphaned = ObjectTag.objects.filter(deletion_locked=True, taxonomy__isnull=True)
+    orphaned_before = set(orphaned.values_list("pk", flat=True))
+    # The taxonomy is deleted by id, since a retry can't reuse an instance whose delete() already ran.
+    Taxonomy.objects.filter(pk=taxonomy_id).delete()
+    if orphaned.exclude(pk__in=orphaned_before).exists():
+        raise _ConcurrentWrite("A tag association was deletion-locked while its taxonomy was being deleted.")
     return True
 
 

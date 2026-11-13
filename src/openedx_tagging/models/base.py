@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from functools import partial
 from typing import ClassVar, List, NamedTuple, Self, TypeVar, cast
 
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import IntegrityError, NotSupportedError, connections, models, router, transaction
-from django.db.models import F, ProtectedError, RestrictedError, Value
+from django.db.models import F, ProtectedError, Value
 from django.db.models.functions import Concat, Length, Replace, Substr
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
@@ -391,15 +392,15 @@ Tag.IsArchived = TagIsArchived
 _T = TypeVar("_T")
 
 # How many times a delete is tried before concurrent writes are allowed to fail it.
-DELETE_ATTEMPTS = 3
+_DELETE_ATTEMPTS = 3
 
 
 class ConcurrentDeleteError(Exception):
     """
-    Raised when a tag or taxonomy delete gives up because other requests kept changing the same records.
+    Raised when a tag delete gives up because other requests kept changing the same tags.
 
     Nothing was changed, and the same request can be made again. This is separate from a database error, so
-    that callers can tell "try again" apart from "something is wrong". Only ``Taxonomy.delete_tags()`` raises it.
+    that callers can tell "try again" apart from "something is wrong".
     """
 
 
@@ -407,27 +408,29 @@ class _ConcurrentWrite(Exception):
     """Raised inside a delete attempt that finds another transaction changed what it had read."""
 
 
-def retry_on_concurrent_write(attempt: Callable[[], _T]) -> _T:
+def _retry_on_concurrent_write(attempt: Callable[[], _T]) -> _T:
     """
     Run ``attempt`` in a transaction and return its result, trying again if a concurrent write got in its way.
 
-    This is how the tag and taxonomy deletes cope with a concurrent write without row-locking anything before
-    they write. An attempt fails when its own checks find that another transaction changed what it had read, or
-    when the database refuses its delete, which a row added by another transaction causes. Either way the
-    attempt is rolled back, and the next attempt reads the new state.
+    An attempt writes first and then checks whether another transaction changed what it had read. If one did,
+    or if the database refuses the delete, the attempt is rolled back and the next one reads the new state.
 
-    :raises ConcurrentDeleteError: If the last of ``DELETE_ATTEMPTS`` attempts fails one of its own checks.
+    When the caller is already in a transaction, each attempt is a savepoint, and the caller's transaction stays
+    usable after a failed attempt. A database deadlock is the exception: it raises ``OperationalError``, which is
+    not retried, and the database rolls back the caller's whole transaction.
+
+    :raises ConcurrentDeleteError: If the last of the attempts fails one of its own checks.
     :raises IntegrityError: If the database refuses the last attempt. It is raised as it is, since a refusal
         that survives every attempt may not be a concurrent write at all.
-    :raises ProtectedError, RestrictedError: Straight away, since another attempt would raise it again.
+    :raises ProtectedError: Straight away, since another attempt would raise it again.
     """
-    attempts_left = DELETE_ATTEMPTS
+    attempts_left = _DELETE_ATTEMPTS
     while True:
         attempts_left -= 1
         try:
             with transaction.atomic():
                 return attempt()
-        except (ProtectedError, RestrictedError):
+        except ProtectedError:
             raise
         except IntegrityError:
             if not attempts_left:
@@ -435,7 +438,7 @@ def retry_on_concurrent_write(attempt: Callable[[], _T]) -> _T:
         except _ConcurrentWrite as exc:
             if not attempts_left:
                 raise ConcurrentDeleteError(
-                    f"Gave up after {DELETE_ATTEMPTS} attempts, because other requests kept changing the same records."
+                    f"Gave up after {_DELETE_ATTEMPTS} attempts, because other requests kept changing the same tags."
                 ) from exc
 
 
@@ -455,7 +458,8 @@ def _split_archive_and_delete(
     to delete.
 
     A tag is archived if it is in ``locked_ids`` or is above a tag that is. Deleting the top of each subtree is
-    enough, since the cascade from ``Tag.parent`` removes the rest.
+    enough, since the cascade from ``Tag.parent`` removes the rest. Returning every tag to delete would end in the
+    same rows deleted; returning only the tops saves the delete from being told about each one.
     """
     archive_ids: set[int] = set()
     for locked_id in locked_ids:
@@ -841,7 +845,8 @@ class Taxonomy(models.Model):
         if tag_to_update.archived:
             raise ValueError("update_tag() doesn't work for archived taxonomies or tags. They cannot be modified.")
         tag_to_update.value = new_value
-        tag_to_update.save()
+        # Only what a rename changes is written, so that an archive made since the tag was read isn't overwritten.
+        tag_to_update.save(update_fields=["value", "lineage"])
         return tag_to_update
 
     def delete_tags(self, tags: List[str], with_subtags: bool = False):
@@ -850,8 +855,10 @@ class Taxonomy(models.Model):
 
         A tag is archived instead if it, or any tag beneath it, has a deletion-locked association (``ObjectTag``).
 
-        Fails if any of the tags have unarchived sub-tags, at any depth, and `with_subtags` is not `True`. Raises
-        ConcurrentDeleteError if tags or deletion locks kept being added beneath these tags on every attempt.
+        :raises ValueError: If the taxonomy is free-text or read-only, if a value is not a tag of this taxonomy, or
+            if a tag has unarchived sub-tags, at any depth, and `with_subtags` is not `True`.
+        :raises ConcurrentDeleteError: If tags or deletion locks kept being added beneath these tags on every
+            attempt.
         """
         if self.allow_free_text:
             raise ValueError(
@@ -863,14 +870,15 @@ class Taxonomy(models.Model):
                 "delete_tags() doesn't work for read-only taxonomies. They cannot be modified."
             )
 
-        retry_on_concurrent_write(lambda: self._delete_or_archive_tags(tags, with_subtags))
+        _retry_on_concurrent_write(partial(self._delete_or_archive_tags, tags, with_subtags))
 
     def _delete_or_archive_tags(self, tags: List[str], with_subtags: bool) -> None:
         """
         Make one attempt at ``delete_tags()``. Needs a transaction.
 
-        Nothing is row-locked before the writes. The two checks after the delete catch a concurrent write that
-        made the reads out of date, and raise so that this attempt is rolled back and made again.
+        The two checks after the delete catch a tag or a deletion lock that another transaction added after the
+        reads, and raise so that this attempt is rolled back and made again. They do not catch an association
+        that already was deletion-locked without a tag and was relinked to one of these tags meanwhile.
         """
         removal = self._collect_subtrees(tags, with_subtags)
         locked = ObjectTag.objects.filter(tag_id__in=list(removal), deletion_locked=True)
@@ -880,7 +888,8 @@ class Taxonomy(models.Model):
         if not delete_roots:
             return
 
-        # A deletion-locked association with no tag is what a wrongly deleted tag leaves behind.
+        # Deleting a tag clears the tag of its associations. A deletion-locked association in this taxonomy that
+        # has no tag after the delete, and had one before, is one this delete should have archived for.
         orphaned = self.objecttag_set.filter(deletion_locked=True, tag__isnull=True)
         orphaned_before = set(orphaned.values_list("pk", flat=True))
         _total, deleted = self.tag_set.filter(id__in=delete_roots).delete()

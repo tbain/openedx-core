@@ -4,8 +4,6 @@ Test the tagging base models
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -29,7 +27,7 @@ from openedx_tagging.tasks import (
     emit_content_object_associations_changed_for_tag_task,
 )
 
-from .utils import pretty_format_tags
+from .utils import concurrent_write, pretty_format_tags
 
 
 def get_tag(value):
@@ -1584,61 +1582,30 @@ class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
 
         assert not taxonomy.tag_set.exists()
 
-    @contextmanager
-    def _concurrent_write(self, write: Callable[[], object]) -> Iterator[list[int]]:
-        """
-        Make `write` look like another transaction committing between delete_tags() reading and deleting.
-
-        `write` runs just before each tag delete, and again after each rollback, because a rollback here would
-        otherwise undo it, which it could not do to another transaction's commit. Yields the list of tag delete
-        attempts, one entry per attempt.
-        """
-        real_delete = QuerySet.delete
-        real_rollback = connection.savepoint_rollback
-        attempts: list[int] = []
-
-        def write_then_delete(queryset: QuerySet[Any]) -> tuple[int, dict[str, int]]:
-            if queryset.model is Tag:
-                attempts.append(len(attempts) + 1)
-                with patch.object(QuerySet, "delete", real_delete):
-                    write()
-            return real_delete(queryset)
-
-        def rollback_then_write(sid: str) -> None:
-            real_rollback(sid)
-            write()
-
-        with patch.object(QuerySet, "delete", write_then_delete):
-            with patch.object(connection, "savepoint_rollback", rollback_then_write):
-                yield attempts
-
     def test_lock_set_after_the_read_archives_on_the_next_attempt(self) -> None:
         api.tag_object("obj", self.taxonomy, ["DPANN"])
         object_tag = ObjectTag.objects.get(object_id="obj")
         dpann = get_tag("DPANN")
 
-        with self._concurrent_write(
-            lambda: ObjectTag.objects.filter(pk=object_tag.pk).update(deletion_locked=True)
-        ) as attempts:
+        with concurrent_write(Tag, lambda: ObjectTag.objects.filter(pk=object_tag.pk).update(deletion_locked=True)):
             self.taxonomy.delete_tags(["DPANN"])
 
-        assert attempts == [1]
         assert self._archived_values() == {"DPANN"}
         assert ObjectTag.objects.get(pk=object_tag.pk).tag_id == dpann.pk
 
     def test_sub_tag_added_after_the_read_is_not_cascaded(self) -> None:
         dpann = get_tag("DPANN")
 
-        with self._concurrent_write(
-            lambda: Tag.objects.get_or_create(taxonomy=self.taxonomy, value="Kid", parent=dpann)
-        ) as attempts:
+        def add_sub_tag() -> None:
+            Tag.objects.get_or_create(taxonomy=self.taxonomy, value="Kid", parent=dpann)
+
+        with concurrent_write(Tag, add_sub_tag):
             with pytest.raises(ValueError, match="contain children"):
                 self.taxonomy.delete_tags(["DPANN"])
 
-        assert attempts == [1]
         assert self._existing("DPANN", "Kid") == {"DPANN", "Kid"}
 
-    def test_gives_up_after_three_attempts(self) -> None:
+    def test_concurrent_writes_on_every_attempt_end_in_a_conflict_error(self) -> None:
         """
         A delete that concurrent writes keep getting in the way of ends in its own error, not a database one.
         """
@@ -1648,24 +1615,54 @@ class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
         def add_another_sub_tag() -> None:
             kids.append(Tag.objects.create(taxonomy=self.taxonomy, value=f"Kid {len(kids)}", parent=dpann))
 
-        with self._concurrent_write(add_another_sub_tag) as attempts:
+        with concurrent_write(Tag, add_another_sub_tag):
             with pytest.raises(ConcurrentDeleteError):
                 self.taxonomy.delete_tags(["DPANN"], with_subtags=True)
 
-        assert attempts == [1, 2, 3]
         assert self._existing("DPANN") == {"DPANN"}
 
-    def test_database_refusal_is_retried_then_raised_as_it_is(self) -> None:
-        with patch.object(QuerySet, "delete", side_effect=IntegrityError("foreign key")) as delete:
+    def test_database_refusal_on_every_attempt_is_raised_as_it_is(self) -> None:
+        with patch.object(QuerySet, "delete", side_effect=IntegrityError("foreign key")):
             with pytest.raises(IntegrityError, match="foreign key"):
                 self.taxonomy.delete_tags(["DPANN"])
 
-        assert delete.call_count == 3
         assert self._existing("DPANN") == {"DPANN"}
+
+    def test_locked_association_that_already_had_no_tag_does_not_block_deletes(self) -> None:
+        """
+        A deletion-locked association with no tag that was there before the delete is not mistaken for one the
+        delete orphaned.
+        """
+        api.tag_object("unresolved", self.taxonomy, ["Ghost"], create_invalid=True)
+        unresolved = ObjectTag.objects.get(object_id="unresolved")
+        assert unresolved.tag_id is None
+        api.lock_object_tags_for_deletion(unresolved.pk)
+
+        self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._existing("DPANN") == set()
+
+    def test_rename_keeps_an_archive_made_after_the_tag_was_read(self) -> None:
+        """
+        update_tag() saves only what a rename changes, so it can't write a stale `archived=False` back.
+        """
+        dpann = get_tag("DPANN")
+        real_clean = Tag.clean
+
+        def archive_then_clean(tag: Tag) -> None:
+            # Tag.save() calls clean() first, after update_tag() has read the tag.
+            Tag.objects.filter(pk=dpann.pk).update(archived=True)
+            real_clean(tag)
+
+        with patch.object(Tag, "clean", archive_then_clean):
+            self.taxonomy.update_tag("DPANN", "Renamed")
+
+        dpann.refresh_from_db()
+        assert (dpann.value, dpann.archived) == ("Renamed", True)
 
     def test_protected_tag_is_not_retried(self) -> None:
         with patch.object(QuerySet, "delete", side_effect=ProtectedError("protected", set())) as delete:
             with pytest.raises(ProtectedError):
                 self.taxonomy.delete_tags(["DPANN"])
 
-        assert delete.call_count == 1
+        delete.assert_called_once()

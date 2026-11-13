@@ -15,6 +15,7 @@ from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
 from ...api import (
+    ConcurrentDeleteError,
     TagDoesNotExist,
     add_tag_to_taxonomy,
     add_usage_counts,
@@ -32,7 +33,7 @@ from ...api import (
 from ...data import TagDataQuerySet
 from ...import_export.api import export_tags, import_tags
 from ...import_export.parsers import ParserFormat
-from ...models import ConcurrentDeleteError, Tag, Taxonomy
+from ...models import Tag, Taxonomy
 from ...rules import ObjectTagPermissionItem
 from ..paginators import MAX_FULL_DEPTH_THRESHOLD, DisabledTagsPagination, TagsPagination, TaxonomyPagination
 from ..utils import view_auth_classes
