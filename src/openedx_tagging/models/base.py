@@ -86,9 +86,13 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
 
         :return: Django's ``(total, {model_label: count})`` result, counting archived object tags as deleted.
         """
-        # select_for_update() marks the queryset for writing, so only then does .db name the write database,
-        # while still honoring an explicit .using().
+        # A model with a cascading foreign key to ObjectTag makes Django read the rows and then delete them by
+        # primary key, so a `deletion_locked=False` filter would only be checked at read time. Locking the rows
+        # first makes a concurrent lock_object_tags_for_deletion() call wait, find the row gone, and raise
+        # DoesNotExist, instead of locking a row that this transaction then deletes.
+        # No test covers this: it would need two concurrent transactions.
         row_locking_queryset = self.select_for_update()
+        # A queryset marked for update names the write database as its .db, and still honors an explicit .using().
         database_alias = row_locking_queryset.db
         if connections[database_alias].features.has_select_for_update_of:
             # of=("self",) keeps MySQL and PostgreSQL from also locking the joined Tag and Taxonomy rows, and
@@ -97,12 +101,6 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
         write_database_object_tags = self.model.objects.using(database_alias)
 
         with transaction.atomic(using=database_alias):
-            # Lock the rows before reading their deletion_locked flags. CompetencyCriterion has a cascading foreign
-            # key to ObjectTag, so Django's delete reads the rows and then deletes them by primary key, which means a
-            # `deletion_locked=False` filter on the delete would only be checked when the rows are read. With the
-            # rows locked, a concurrent lock_object_tags_for_deletion() call waits, and then finds an unlocked row
-            # gone and raises DoesNotExist, instead of locking a row that this transaction then deletes.
-            # SQLite ignores row locks, so no test exercises this.
             deletion_locked_by_id = dict(row_locking_queryset.values_list("pk", "deletion_locked"))
             ids_to_archive = []
             ids_to_delete = []

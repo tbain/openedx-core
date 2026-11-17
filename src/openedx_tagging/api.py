@@ -401,8 +401,8 @@ def _find_existing_object_tag(
     Find the object tag that the object already has for one of the tags that `tag_object()` was asked to apply.
 
     `tag_object()` receives the full list of tags that an object should have. For each one, this looks through
-    ``existing_object_tags`` (which may include archived ones) for the object tag that already stands for it, so
-    that row is kept and restored instead of a duplicate being created.
+    ``existing_object_tags`` (which may include archived ones) for the object tag that already links the object to
+    that tag or value, so that row is kept and restored instead of a duplicate being created.
 
     If ``tag`` is given, the existing object tag with that tag is the one. If ``tag`` is ``None``, which is the case
     for free-text, unresolved and no-taxonomy values, it is the existing object tag with no tag whose stored value
