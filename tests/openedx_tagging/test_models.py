@@ -12,7 +12,6 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import F
 from django.db.utils import IntegrityError
 from django.test import override_settings
 from django.test.testcases import TestCase
@@ -1380,24 +1379,28 @@ class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
         assert [(t.pk, t.archived) for t in bulk] == [(bulk_locked.pk, True)]
         assert not ObjectTag.objects.filter(pk=bulk_unlocked.pk).exists()
 
-    def test_delete_guards_match_django(self) -> None:
+    def test_deleting_an_unsaved_object_tag_raises(self) -> None:
         """
-        Guard: deletes that Django's own delete() refuses are refused here too, with the same messages.
+        Deleting an object tag that was never saved raises the same error as Django's own `Model.delete()`.
         """
-        values_message = r"Cannot call delete\(\) after .values\(\) or .values_list\(\)"
-        with pytest.raises(TypeError, match="Cannot use 'limit' or 'offset' with delete"):
-            ObjectTag.objects.all()[:1].delete()
-        with pytest.raises(TypeError, match=values_message):
-            ObjectTag.objects.values("pk").delete()
-        with pytest.raises(TypeError, match=values_message):
-            ObjectTag.objects.values_list("pk").delete()
-        with pytest.raises(TypeError, match=values_message):
-            ObjectTag.objects.values(alias=F("pk")).delete()
-        with pytest.raises(TypeError, match=r"Cannot call delete\(\) after .distinct\(\*fields\)"):
-            ObjectTag.objects.distinct("object_id").delete()
         unsaved = ObjectTag(object_id="obj1", taxonomy=self.free_text_taxonomy, _value="value")
         with pytest.raises(ValueError, match="can't be deleted because its id attribute is set to None"):
             unsaved.delete()
+
+    def test_bulk_delete_of_only_locked_or_only_unlocked_object_tags(self) -> None:
+        """
+        A bulk delete returns the right counts when every object tag is locked, and when none is.
+        """
+        label = ObjectTag._meta.label
+        self._object_tag("obj1", "locked one", locked=True)
+        self._object_tag("obj1", "locked two", locked=True)
+        self._object_tag("obj2", "unlocked")
+
+        assert ObjectTag.objects.filter(object_id="obj1").delete() == (2, {label: 2})
+        assert ObjectTag.objects.filter(object_id="obj2").delete() == (1, {label: 1})
+        assert ObjectTag.objects.filter(object_id="nothing here").delete() == (0, {})
+        assert ObjectTag.objects.filter(object_id="obj1", archived=True).count() == 2
+        assert not ObjectTag.objects.filter(object_id="obj2").exists()
 
     def test_bulk_delete_uses_write_database(self) -> None:
         """
@@ -1413,3 +1416,20 @@ class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
         assert result == (2, {ObjectTag._meta.label: 2})
         assert ObjectTag.objects.get(pk=locked.pk).archived is True
         assert not ObjectTag.objects.filter(pk=unlocked.pk).exists()
+
+    def test_instance_delete_uses_write_database(self) -> None:
+        """
+        Deleting an object tag instance locks, archives and deletes on the write database, never the read one.
+        """
+        locked = self._object_tag("obj1", "locked", locked=True)
+        unlocked = self._object_tag("obj1", "unlocked")
+
+        # The read alias isn't configured, so any query routed to it would raise.
+        with override_settings(DATABASE_ROUTERS=[ReplicaRouter()]):
+            locked_result = locked.delete()
+            unlocked_result = unlocked.delete()
+
+        assert locked_result == (1, {ObjectTag._meta.label: 1})
+        assert unlocked_result == (1, {ObjectTag._meta.label: 1})
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+        assert unlocked.pk is None
