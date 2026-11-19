@@ -13,6 +13,7 @@ from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import IntegrityError, connections, models, router, transaction
 from django.db.models import F, ProtectedError, Value
 from django.db.models.functions import Concat, Length, Replace, Substr
+from django.dispatch import Signal
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 
@@ -393,6 +394,10 @@ class TagIsArchived(Tag.DoesNotExist):
 
 Tag.IsArchived = TagIsArchived
 
+
+# Sent by Taxonomy.delete_tags() with ``tag_ids``, the tags it has just archived. signal_handlers.py receives it,
+# because importing tasks.py here would be circular.
+_tags_archived_signal = Signal()
 
 _T = TypeVar("_T")
 
@@ -899,6 +904,11 @@ class Taxonomy(models.Model):
         archive_ids, delete_roots = _split_archive_and_delete(removal, set(locked.values_list("tag_id", flat=True)))
         if archive_ids:
             self.tag_set.filter(id__in=archive_ids).update(archived=True)
+            # A bulk update sends no model signal, so the archive is announced here. Tags that were already archived
+            # are skipped, because this call changes nothing about them.
+            newly_archived_ids = [tag_id for tag_id in archive_ids if not removal[tag_id].archived]
+            if newly_archived_ids:
+                _tags_archived_signal.send(sender=Taxonomy, tag_ids=newly_archived_ids)
         if not delete_roots:
             # With nothing to delete, the checks below have nothing to count, so the tags are collected again.
             if self._collect_subtrees(tags, with_subtags).keys() != removal.keys():
