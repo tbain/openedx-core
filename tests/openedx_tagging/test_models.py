@@ -25,9 +25,10 @@ from openedx_tagging.signal_handlers import _is_explicit_tag_delete
 from openedx_tagging.tasks import (
     emit_content_object_associations_changed_for_object_ids_task,
     emit_content_object_associations_changed_for_tag_task,
+    queue_content_object_associations_changed,
 )
 
-from .utils import concurrent_write, pretty_format_tags
+from .utils import OBJECT_IDS_TASK_PATCH_TARGET, concurrent_write, pretty_format_tags, queued_object_id_chunks
 
 
 def get_tag(value):
@@ -1244,6 +1245,79 @@ class TestTagLineage(TestCase):
         assert emitted_object_ids == {first_object_id, second_object_id}
 
 
+@ddt.ddt
+class TestQueueContentObjectAssociationsChanged(TestCase):
+    """
+    Test that queue_content_object_associations_changed() queues object ids in chunks once the transaction commits.
+    """
+
+    def _queue(self, object_ids: list[str]) -> None:
+        with self.captureOnCommitCallbacks(execute=True):
+            queue_content_object_associations_changed(object_ids)
+
+    @ddt.data((500, [500]), (501, [500, 1]))
+    @ddt.unpack
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_ids_are_queued_in_chunks_of_500(self, count: int, chunk_sizes: list[int], mock_delay) -> None:
+        object_ids = [f"obj-{index:04}" for index in range(count)]
+
+        self._queue(object_ids)
+
+        queued = queued_object_id_chunks(mock_delay)
+        assert [len(chunk) for chunk in queued] == chunk_sizes
+        assert [object_id for chunk in queued for object_id in chunk] == object_ids
+
+    @ddt.data((["b", "a", "b"], ["a", "b"]), (["obj", "Obj"], ["Obj", "obj"]))
+    @ddt.unpack
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_each_distinct_id_is_queued_once(self, object_ids: list[str], queued_ids: list[str], mock_delay) -> None:
+        self._queue(object_ids)
+
+        assert queued_object_id_chunks(mock_delay) == [queued_ids]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_failed_chunk_does_not_stop_later_chunks(self, mock_delay) -> None:
+        mock_delay.side_effect = [RuntimeError("broker down"), None]
+        object_ids = [f"obj-{index:04}" for index in range(501)]
+
+        with pytest.raises(RuntimeError, match="broker down"):
+            self._queue(object_ids)
+
+        assert [len(chunk) for chunk in queued_object_id_chunks(mock_delay)] == [500, 1]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_each_failed_chunk_is_logged(self, mock_delay) -> None:
+        mock_delay.side_effect = RuntimeError("broker down")
+        object_ids = [f"obj-{index:04}" for index in range(501)]
+
+        with self.assertLogs("openedx_tagging.tasks", level="ERROR") as logs:
+            with pytest.raises(RuntimeError, match="broker down"):
+                self._queue(object_ids)
+
+        assert [record.getMessage() for record in logs.records] == [
+            "Could not queue CONTENT_OBJECT_ASSOCIATIONS_CHANGED events. "
+            "Chunk size: 500. First object ID: obj-0000. Last object ID: obj-0499.",
+            "Could not queue CONTENT_OBJECT_ASSOCIATIONS_CHANGED events. "
+            "Chunk size: 1. First object ID: obj-0500. Last object ID: obj-0500.",
+        ]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_no_ids_queue_nothing(self, mock_delay) -> None:
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            queue_content_object_associations_changed([])
+
+        assert not callbacks
+        assert mock_delay.call_count == 0
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_nothing_is_queued_before_commit(self, mock_delay) -> None:
+        with self.captureOnCommitCallbacks() as callbacks:
+            queue_content_object_associations_changed(["a"])
+
+        assert len(callbacks) == 1
+        assert mock_delay.call_count == 0
+
+
 class TestTagExternalIdCandidate(TestCase):
     """
     Direct unit tests for the tag_external_id_candidate() helper.
@@ -1549,6 +1623,145 @@ class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
 
         notified = {object_id for call in mock_task_delay.call_args_list for object_id in call.kwargs["object_ids"]}
         assert "obj-a" in notified
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_archived_tag_notifies_each_tagged_object_once(self, mock_delay) -> None:
+        self._lock("DPANN")
+        api.tag_object("obj-b", self.taxonomy, ["DPANN"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.taxonomy.delete_tags(["DPANN"])
+
+        assert queued_object_id_chunks(mock_delay) == [["locked-object", "obj-b"]]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_objects_on_ancestor_of_locked_tag_are_notified(self, mock_delay) -> None:
+        self._lock("Mammalia")
+        api.tag_object("on-ancestor", self.taxonomy, ["Chordata"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.taxonomy.delete_tags(["Chordata"], with_subtags=True)
+
+        assert self._archived_values() == {"Chordata", "Mammalia"}
+        assert queued_object_id_chunks(mock_delay) == [["locked-object", "on-ancestor"]]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_objects_on_other_tags_are_not_notified(self, mock_delay) -> None:
+        self._lock("DPANN")
+        api.tag_object("other-tag", self.taxonomy, ["Euryarchaeida"])
+        api.tag_object("other-taxonomy", self.free_text_taxonomy, ["anything"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.taxonomy.delete_tags(["DPANN"])
+
+        assert queued_object_id_chunks(mock_delay) == [["locked-object"]]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_object_with_several_archived_tags_is_notified_once(self, mock_delay) -> None:
+        values = ["DPANN", "Euryarchaeida", "Proteoarchaeota", "Eubacteria"]
+        self.taxonomy.allow_multiple = True
+        self.taxonomy.save()
+        api.tag_object("multi", self.taxonomy, values)
+        api.lock_object_tags_for_deletion(
+            list(ObjectTag.objects.filter(object_id="multi").values_list("pk", flat=True))
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.taxonomy.delete_tags(values)
+
+        assert self._archived_values() == set(values)
+        assert queued_object_id_chunks(mock_delay) == [["multi"]]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_archive_with_only_archived_associations_queues_nothing(self, mock_delay) -> None:
+        object_tag = self._lock("DPANN")
+        ObjectTag.objects.filter(pk=object_tag.pk).update(archived=True)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._archived_values() == {"DPANN"}
+        assert mock_delay.call_count == 0
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_already_archived_tag_is_not_notified_again(self, mock_delay) -> None:
+        self._lock("Eubacteria")
+        self.taxonomy.delete_tags(["Eubacteria"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.taxonomy.delete_tags(["Bacteria"], with_subtags=True)
+
+        assert self._archived_values() == {"Eubacteria", "Bacteria"}
+        assert mock_delay.call_count == 0
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_archive_and_hard_delete_in_one_request_notify_both(self, mock_delay) -> None:
+        self._lock("Mammalia")
+        api.tag_object("obj-a", self.taxonomy, ["Arthropoda"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.taxonomy.delete_tags(["Animalia"], with_subtags=True)
+
+        queued = queued_object_id_chunks(mock_delay)
+        assert {object_id for chunk in queued for object_id in chunk} == {"locked-object", "obj-a"}
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_rolled_back_attempt_queues_once(self, mock_delay) -> None:
+        self._lock("DPANN")
+        dpann = get_tag("DPANN")
+
+        def add_sub_tag() -> None:
+            Tag.objects.get_or_create(taxonomy=self.taxonomy, value="Kid", parent=dpann)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            with concurrent_write(Tag, add_sub_tag, before="update"):
+                self.taxonomy.delete_tags(["DPANN"], with_subtags=True)
+
+        assert queued_object_id_chunks(mock_delay) == [["locked-object"]]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_delete_that_gives_up_queues_nothing(self, mock_delay) -> None:
+        self._lock("Mammalia")
+        arthropoda = get_tag("Arthropoda")
+        kids: list[Tag] = []
+
+        def add_another_sub_tag() -> None:
+            kids.append(Tag.objects.create(taxonomy=self.taxonomy, value=f"Kid {len(kids)}", parent=arthropoda))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            with concurrent_write(Tag, add_another_sub_tag):
+                with pytest.raises(api.ConcurrentDeleteError):
+                    self.taxonomy.delete_tags(["Animalia"], with_subtags=True)
+
+        assert self._archived_values() == set()
+        assert mock_delay.call_count == 0
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_archive_stands_when_queueing_fails(self, mock_delay) -> None:
+        mock_delay.side_effect = RuntimeError("broker down")
+        self._lock("DPANN")
+
+        with pytest.raises(RuntimeError, match="broker down"):
+            with self.captureOnCommitCallbacks(execute=True):
+                self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._archived_values() == {"DPANN"}
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_notification_query_count_does_not_grow_with_objects(self, mock_delay) -> None:
+        self._lock("DPANN", "one")
+        self._lock("Euryarchaeida", "many-0")
+        for index in range(1, 5):
+            api.tag_object(f"many-{index}", self.taxonomy, ["Euryarchaeida"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            with CaptureQueriesContext(connection) as one_object:
+                self.taxonomy.delete_tags(["DPANN"])
+            with CaptureQueriesContext(connection) as five_objects:
+                self.taxonomy.delete_tags(["Euryarchaeida"])
+
+        assert [len(chunk) for chunk in queued_object_id_chunks(mock_delay)] == [1, 5]
+        assert len(one_object) == len(five_objects)
 
     @ddt.data(
         ("free_text_taxonomy", ["anything"], "free text taxonomies"),

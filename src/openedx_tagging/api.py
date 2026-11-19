@@ -29,6 +29,7 @@ from .data import TagDataQuerySet
 from .models import ObjectTag, Tag, Taxonomy
 from .models.base import ConcurrentDeleteError as _ConcurrentDeleteError
 from .models.base import _ConcurrentWrite, _retry_on_concurrent_write
+from .tasks import queue_content_object_associations_changed
 
 # Export this as part of the API
 TagDoesNotExist = Tag.DoesNotExist
@@ -734,8 +735,17 @@ def delete_taxonomy(taxonomy: Taxonomy) -> None:
     if not is_taxonomy_locked_for_deletion(taxonomy_id):
         if _retry_on_concurrent_write(partial(_delete_taxonomy_unless_locked, taxonomy_id)):
             return
-    Taxonomy.objects.filter(pk=taxonomy_id).update(archived=True)
+    # A bulk update sends no signal, so the event for the content objects tagged in this taxonomy is queued here.
+    # A taxonomy that was already archived is skipped, because this call changes nothing about it.
+    newly_archived = Taxonomy.objects.filter(pk=taxonomy_id, archived=False).update(archived=True)
     taxonomy.archived = True
+    if newly_archived:
+        # An archived association is already hidden from its content object, so it is left out.
+        queue_content_object_associations_changed(
+            ObjectTag.objects.filter(taxonomy_id=taxonomy_id, archived=False)
+            .values_list("object_id", flat=True)
+            .distinct()
+        )
 
 
 def _delete_taxonomy_unless_locked(taxonomy_id: int) -> bool:

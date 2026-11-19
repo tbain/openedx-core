@@ -6,10 +6,22 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.db import connection
 from django.db.models import Model, QuerySet
+
+# Patch target for the task call that queues CONTENT_OBJECT_ASSOCIATIONS_CHANGED events for a list of object ids.
+OBJECT_IDS_TASK_PATCH_TARGET = (
+    "openedx_tagging.tasks.emit_content_object_associations_changed_for_object_ids_task.delay"
+)
+
+
+def queued_object_id_chunks(mock_delay: MagicMock) -> list[list[str]]:
+    """
+    Return the object ids passed to each call of the patched `OBJECT_IDS_TASK_PATCH_TARGET`, in call order.
+    """
+    return [call.kwargs["object_ids"] for call in mock_delay.call_args_list]
 
 
 @contextmanager

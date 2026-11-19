@@ -19,7 +19,7 @@ from openedx_tagging.api import _get_current_tags as get_current_tags_unpatched
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
 
 from .test_models import TestTagTaxonomyMixin, get_tag
-from .utils import concurrent_write, pretty_format_tags
+from .utils import OBJECT_IDS_TASK_PATCH_TARGET, concurrent_write, pretty_format_tags, queued_object_id_chunks
 
 tag_values_for_autocomplete_test = [
     'Archaea',
@@ -2076,3 +2076,123 @@ class TestDeleteTaxonomy(TestTagTaxonomyMixin, TestCase):
 
         object_tag = ObjectTag.objects.get(object_id="obj1")
         assert (object_tag.tag_id, object_tag.taxonomy_id) == (self.mammalia.pk, self.taxonomy.pk)
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_unlocked_taxonomy_delete_notifies_as_before(self, mock_delay) -> None:
+        self._association(locked=False)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert queued_object_id_chunks(mock_delay) == [["obj1"]]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_archived_taxonomy_notifies_each_tagged_object_once(self, mock_delay) -> None:
+        self._association(locked=True)
+        tagging_api.tag_object("obj2", self.taxonomy, ["Bacteria"])
+        tagging_api.tag_object("obj3", self.taxonomy, ["DPANN"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert queued_object_id_chunks(mock_delay) == [["obj1", "obj2", "obj3"]]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_objects_in_other_taxonomies_are_not_notified(self, mock_delay) -> None:
+        self._association(locked=True)
+        tagging_api.tag_object("other-taxonomy", self.free_text_taxonomy, ["anything"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert queued_object_id_chunks(mock_delay) == [["obj1"]]
+
+    def test_instance_is_archived_when_queueing_raises(self) -> None:
+        self._association(locked=True)
+
+        with patch.object(tagging_api, "queue_content_object_associations_changed", side_effect=RuntimeError("down")):
+            with pytest.raises(RuntimeError, match="down"):
+                tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert self.taxonomy.archived is True
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_object_with_several_tags_in_archived_taxonomy_is_notified_once(self, mock_delay) -> None:
+        self.taxonomy.allow_multiple = True
+        self.taxonomy.save()
+        tagging_api.tag_object("multi", self.taxonomy, ["Bacteria", "Archaea", "DPANN", "Mammalia"])
+        tagging_api.lock_object_tags_for_deletion(
+            list(ObjectTag.objects.filter(object_id="multi").values_list("pk", flat=True))
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert queued_object_id_chunks(mock_delay) == [["multi"]]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_archive_with_only_archived_associations_queues_nothing(self, mock_delay) -> None:
+        object_tag = self._association(locked=True)
+        ObjectTag.objects.filter(pk=object_tag.pk).update(archived=True)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert Taxonomy.objects.get(pk=self.taxonomy.pk).archived is True
+        assert mock_delay.call_count == 0
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_already_archived_taxonomy_is_not_notified_again(self, mock_delay) -> None:
+        self._association(locked=True)
+        tagging_api.delete_taxonomy(self.taxonomy)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert Taxonomy.objects.get(pk=self.taxonomy.pk).archived is True
+        assert mock_delay.call_count == 0
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_archived_free_text_taxonomy_notifies_its_objects(self, mock_delay) -> None:
+        tagging_api.tag_object("free", self.free_text_taxonomy, ["anything"])
+        tagging_api.lock_object_tags_for_deletion(ObjectTag.objects.get(object_id="free").pk)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            tagging_api.delete_taxonomy(self.free_text_taxonomy)
+
+        assert Taxonomy.objects.get(pk=self.free_text_taxonomy.pk).archived is True
+        assert queued_object_id_chunks(mock_delay) == [["free"]]
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_archive_stands_when_queueing_fails(self, mock_delay) -> None:
+        mock_delay.side_effect = RuntimeError("broker down")
+        self._association(locked=True)
+
+        with pytest.raises(RuntimeError, match="broker down"):
+            with self.captureOnCommitCallbacks(execute=True):
+                tagging_api.delete_taxonomy(self.taxonomy)
+
+        assert Taxonomy.objects.get(pk=self.taxonomy.pk).archived is True
+
+    def _taxonomy_with_tagged_objects(self, name: str, count: int) -> Taxonomy:
+        """Create a taxonomy whose one tag is on `count` objects, the first of them through a locked association."""
+        taxonomy = tagging_api.create_taxonomy(name)
+        tagging_api.add_tag_to_taxonomy(taxonomy, "tag")
+        for index in range(count):
+            tagging_api.tag_object(f"{name}-{index}", taxonomy, ["tag"])
+        tagging_api.lock_object_tags_for_deletion(ObjectTag.objects.get(object_id=f"{name}-0").pk)
+        return taxonomy
+
+    @patch(OBJECT_IDS_TASK_PATCH_TARGET)
+    def test_notification_query_count_does_not_grow_with_objects(self, mock_delay) -> None:
+        one = self._taxonomy_with_tagged_objects("one", 1)
+        five = self._taxonomy_with_tagged_objects("five", 5)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            with CaptureQueriesContext(connection) as one_object:
+                tagging_api.delete_taxonomy(one)
+            with CaptureQueriesContext(connection) as five_objects:
+                tagging_api.delete_taxonomy(five)
+
+        assert [len(chunk) for chunk in queued_object_id_chunks(mock_delay)] == [1, 5]
+        assert len(one_object) == len(five_objects)

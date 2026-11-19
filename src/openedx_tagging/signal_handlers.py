@@ -7,10 +7,11 @@ from django.db.models import QuerySet
 from django.db.models.signals import post_save, pre_delete
 from django.dispatch import receiver
 
-from openedx_tagging.models.base import ObjectTag, Tag
+from openedx_tagging.models.base import ObjectTag, Tag, _tags_archived_signal
 from openedx_tagging.tasks import (
     emit_content_object_associations_changed_for_object_ids_task,
     emit_content_object_associations_changed_for_tag_task,
+    queue_content_object_associations_changed,
 )
 
 
@@ -116,4 +117,16 @@ def tag_pre_delete(sender, **kwargs):  # pylint: disable=unused-argument
             object_ids=object_ids,
         ),
         using=using,
+    )
+
+
+@receiver(_tags_archived_signal)
+def on_tags_archived(tag_ids: list[int], **_kwargs: object) -> None:
+    """
+    If tags are archived, enqueue async event emission for all associated objects.
+
+    Archived associations are left out, because they are already hidden from their content objects.
+    """
+    queue_content_object_associations_changed(
+        ObjectTag.objects.filter(tag_id__in=tag_ids, archived=False).values_list("object_id", flat=True).distinct()
     )
