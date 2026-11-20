@@ -441,12 +441,11 @@ def test_grade_write_and_hard_delete_fail_one_side_never_silently_delete_first(
     user,
 ) -> None:
     """
-    A grade write that races a hard delete already holding the criterion fails, usually with ``IntegrityError``.
+    A grade write that races a hard delete already holding the criterion fails with ``ObjectTag.DoesNotExist``.
 
-    The grade's status insert waits for the delete to commit and then fails the foreign-key check. If the
-    grade transaction also writes a ``StudentCompetencyStatus`` row, which takes a shared lock on the Tag,
-    the grade can instead lose with MySQL deadlock error 1213. The criterion is gone and no status row was
-    written.
+    The grade locks the criterion's tag association before it writes any status, and the delete is removing
+    that association, so the grade's lock waits for the delete to commit and then finds the row gone. The
+    criterion is gone and no status row was written.
     """
     _, criterion = leaf_and_criterion
     pause = pause_before_the_walk(monkeypatch)
@@ -462,7 +461,7 @@ def test_grade_write_and_hard_delete_fail_one_side_never_silently_delete_first(
         pause.release.set()
 
     assert delete.result().archived is False
-    with pytest.raises(IntegrityError):
+    with pytest.raises(ObjectTag.DoesNotExist):
         grade.result()
     assert not CompetencyCriterion.objects.filter(pk=criterion.pk).exists()
     assert not StudentCompetencyCriterionStatus.objects.filter(user=user).exists()

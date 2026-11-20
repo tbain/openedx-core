@@ -3,7 +3,12 @@ from organizations.models import Organization
 
 from openedx_catalog.models import CatalogCourse, CourseRun
 from openedx_learning.applets.cbe.api import _create_leaf_group
-from openedx_learning.models import CompetencyCriterion, CompetencyRuleProfile, CompetencyTaxonomy
+from openedx_learning.models import (
+    CompetencyCriteriaGroup,
+    CompetencyCriterion,
+    CompetencyRuleProfile,
+    CompetencyTaxonomy,
+)
 from openedx_tagging.models import ObjectTag, Tag
 
 
@@ -21,6 +26,24 @@ def make_leaf_criterion(
     leaf = _create_leaf_group(tag, course_run)
     object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, block_id), taxonomy=tag.taxonomy, tag=tag)
     return CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, rule_profile=default_rule_profile)
+
+
+def make_criterion(
+    *,
+    group: CompetencyCriteriaGroup,
+    object_tag: ObjectTag,
+    rule_profile: CompetencyRuleProfile | None = None,
+    override: tuple[str, dict] | None = None,
+) -> CompetencyCriterion:
+    """Build a leaf CompetencyCriterion using whichever of rule_profile or override the caller passes."""
+    rule_type_override, rule_payload_override = override if override is not None else (None, None)
+    return CompetencyCriterion.objects.create(
+        group=group,
+        object_tag=object_tag,
+        rule_profile=rule_profile,
+        rule_type_override=rule_type_override,
+        rule_payload_override=rule_payload_override,
+    )
 
 
 def make_course_run(organization: Organization, course_code: str, run_code: str) -> CourseRun:
