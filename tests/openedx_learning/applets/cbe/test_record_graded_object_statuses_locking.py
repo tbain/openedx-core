@@ -28,38 +28,14 @@ from openedx_tagging.api import (
 )
 from openedx_tagging.models import ObjectTag, Tag
 
+from .utils import make_criterion
+
 pytestmark = pytest.mark.django_db
-
-
-def _make_criterion(
-    *,
-    group: CompetencyCriteriaGroup,
-    object_tag: ObjectTag,
-    rule_profile: CompetencyRuleProfile | None = None,
-    override: tuple[str, dict] | None = None,
-) -> CompetencyCriterion:
-    """Build a leaf CompetencyCriterion using whichever of rule_profile or override the caller passes."""
-    rule_type_override, rule_payload_override = override if override is not None else (None, None)
-    return CompetencyCriterion.objects.create(
-        group=group,
-        object_tag=object_tag,
-        rule_profile=rule_profile,
-        rule_type_override=rule_type_override,
-        rule_payload_override=rule_payload_override,
-    )
 
 
 def _score(object_tag: ObjectTag) -> GradedObjectScore:
     """A passing score for the object behind `object_tag`."""
     return GradedObjectScore(object_id=object_tag.object_id, fraction=Decimal("0.9"))
-
-
-@pytest.fixture(name="criterion")
-def _criterion(
-    group: CompetencyCriteriaGroup, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile
-) -> CompetencyCriterion:
-    """A leaf CompetencyCriterion directly under the root `group`, using the seeded default profile."""
-    return _make_criterion(group=group, object_tag=object_tag, rule_profile=default_rule_profile)
 
 
 @pytest.mark.usefixtures("criterion")
@@ -114,7 +90,7 @@ def test_unappliable_rule_leaves_association_unlocked(
     bad_object_tag = ObjectTag.objects.create(
         object_id="block-v1:Org1+Python100+Fall2026+problem+bad", taxonomy=competency_taxonomy, tag=bad_tag,
     )
-    bad_criterion = _make_criterion(
+    bad_criterion = make_criterion(
         group=bad_group, object_tag=bad_object_tag,
         override=(RuleType.GRADE, {"op": "gte", "value": 0.8, "scale": "percent"}),
     )
@@ -135,7 +111,7 @@ def test_lock_is_one_bulk_call_regardless_of_criteria_count(
     for index in range(criteria_count):
         tag = Tag.objects.create(taxonomy=competency_taxonomy, value=f"Competency {index}")
         object_tag = ObjectTag.objects.create(object_id=object_id, taxonomy=competency_taxonomy, tag=tag)
-        _make_criterion(
+        make_criterion(
             group=CompetencyCriteriaGroup.objects.create(tag=tag),
             object_tag=object_tag,
             rule_profile=default_rule_profile,

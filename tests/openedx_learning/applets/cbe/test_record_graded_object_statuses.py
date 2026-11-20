@@ -31,35 +31,11 @@ from openedx_learning.models import (
 )
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
 
+from .utils import make_criterion
+
 pytestmark = pytest.mark.django_db
 
 CHANGE_OBJECTTAG_OBJECTID = "oel_tagging.change_objecttag_objectid"
-
-
-def _make_criterion(
-    *,
-    group: CompetencyCriteriaGroup,
-    object_tag: ObjectTag,
-    rule_profile: CompetencyRuleProfile | None = None,
-    override: tuple[str, dict] | None = None,
-) -> CompetencyCriterion:
-    """Build a leaf CompetencyCriterion using whichever of rule_profile or override the caller passes."""
-    rule_type_override, rule_payload_override = override if override is not None else (None, None)
-    return CompetencyCriterion.objects.create(
-        group=group,
-        object_tag=object_tag,
-        rule_profile=rule_profile,
-        rule_type_override=rule_type_override,
-        rule_payload_override=rule_payload_override,
-    )
-
-
-@pytest.fixture(name="criterion")
-def _criterion(
-    group: CompetencyCriteriaGroup, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile
-) -> CompetencyCriterion:
-    """A leaf CompetencyCriterion directly under the root `group`, using the seeded default profile."""
-    return _make_criterion(group=group, object_tag=object_tag, rule_profile=default_rule_profile)
 
 
 @pytest.fixture(name="allow_object_level_tagging")
@@ -85,7 +61,7 @@ def test_grade_meeting_threshold_demonstrates(
     user, group: CompetencyCriteriaGroup, object_tag: ObjectTag, rule_profile_75: CompetencyRuleProfile
 ) -> None:
     """A grade of 80% against a 75% threshold demonstrates the criterion."""
-    criterion = _make_criterion(group=group, object_tag=object_tag, rule_profile=rule_profile_75)
+    criterion = make_criterion(group=group, object_tag=object_tag, rule_profile=rule_profile_75)
 
     changed = record_graded_object_statuses(
         user_id=user.id, scores=[GradedObjectScore(object_id=object_tag.object_id, fraction=Decimal("0.80"))],
@@ -99,7 +75,7 @@ def test_grade_below_threshold_is_attempted_not_demonstrated(
     user, group: CompetencyCriteriaGroup, object_tag: ObjectTag, rule_profile_75: CompetencyRuleProfile
 ) -> None:
     """A grade of 60% against a 75% threshold is attempted but not demonstrated."""
-    criterion = _make_criterion(group=group, object_tag=object_tag, rule_profile=rule_profile_75)
+    criterion = make_criterion(group=group, object_tag=object_tag, rule_profile=rule_profile_75)
 
     changed = record_graded_object_statuses(
         user_id=user.id, scores=[GradedObjectScore(object_id=object_tag.object_id, fraction=Decimal("0.60"))],
@@ -130,7 +106,7 @@ def test_threshold_boundary_precision(
     Decimal arithmetic is exact, so a fraction on either side of a 0.75 threshold -- including at
     extreme precision, and including one with trailing zeros -- resolves without rounding error.
     """
-    criterion = _make_criterion(group=group, object_tag=object_tag, rule_profile=rule_profile_75)
+    criterion = make_criterion(group=group, object_tag=object_tag, rule_profile=rule_profile_75)
 
     record_graded_object_statuses(
         user_id=user.id, scores=[GradedObjectScore(object_id=object_tag.object_id, fraction=fraction)],
@@ -203,8 +179,8 @@ def test_one_score_evaluates_each_criterion_on_its_own_threshold(
         object_id=object_tag.object_id, taxonomy=competency_taxonomy, tag=other_tag,
     )
     other_group = CompetencyCriteriaGroup.objects.create(tag=other_tag)
-    criterion = _make_criterion(group=group, object_tag=object_tag, rule_profile=rule_profile_75)
-    other_criterion = _make_criterion(
+    criterion = make_criterion(group=group, object_tag=object_tag, rule_profile=rule_profile_75)
+    other_criterion = make_criterion(
         group=other_group, object_tag=other_object_tag,
         override=(RuleType.GRADE, {"op": "gte", "value": 0.9, "scale": "percent"}),
     )
@@ -308,7 +284,7 @@ def test_unappliable_rule_is_skipped_and_logged(
     bad_object_tag = ObjectTag.objects.create(
         object_id="block-v1:Org1+Python100+Fall2026+problem+bad", taxonomy=competency_taxonomy, tag=bad_tag,
     )
-    bad_criterion = _make_criterion(
+    bad_criterion = make_criterion(
         group=bad_group, object_tag=bad_object_tag,
         override=(RuleType.GRADE, {"op": "gte", "value": 0.8, "scale": "percent"}),
     )
@@ -372,7 +348,7 @@ def test_criterion_on_non_competency_taxonomy_tag_is_not_evaluated(
     plain_object_tag = ObjectTag.objects.create(
         object_id="block-v1:Org1+Python100+Fall2026+problem+plain", taxonomy=plain_taxonomy, tag=plain_tag,
     )
-    _make_criterion(group=group, object_tag=plain_object_tag, rule_profile=default_rule_profile)
+    make_criterion(group=group, object_tag=plain_object_tag, rule_profile=default_rule_profile)
 
     changed = record_graded_object_statuses(
         user_id=user.id, scores=[GradedObjectScore(object_id=plain_object_tag.object_id, fraction=Decimal("0.9"))],
@@ -391,7 +367,7 @@ def test_omitted_zero_point_object_gets_no_status(
     other_object_tag = ObjectTag.objects.create(
         object_id="block-v1:Org1+Python100+Fall2026+problem+unscored", taxonomy=competency_taxonomy, tag=other_tag,
     )
-    other_criterion = _make_criterion(
+    other_criterion = make_criterion(
         group=CompetencyCriteriaGroup.objects.create(tag=other_tag),
         object_tag=other_object_tag,
         rule_profile=default_rule_profile,
@@ -491,7 +467,7 @@ def test_archived_rule_profile_still_evaluates(
         competency_taxonomy=competency_taxonomy, rule_type=RuleType.GRADE,
         rule_payload={"op": "gte", "value": 0.75, "scale": "percent"},
     )
-    criterion = _make_criterion(group=group, object_tag=object_tag, rule_profile=profile)
+    criterion = make_criterion(group=group, object_tag=object_tag, rule_profile=profile)
     profile.archived = True
     profile.save()
 
@@ -516,8 +492,8 @@ def test_archived_criterion_is_skipped(
     other_object_tag = ObjectTag.objects.create(
         object_id="block-v1:Org1+Python100+Fall2026+problem+other", taxonomy=object_tag.taxonomy, tag=tag,
     )
-    with_status = _make_criterion(group=group, object_tag=object_tag, rule_profile=default_rule_profile)
-    without_status = _make_criterion(group=group, object_tag=other_object_tag, rule_profile=default_rule_profile)
+    with_status = make_criterion(group=group, object_tag=object_tag, rule_profile=default_rule_profile)
+    without_status = make_criterion(group=group, object_tag=other_object_tag, rule_profile=default_rule_profile)
     with freeze_time(first_time):
         record_graded_object_statuses(
             user_id=user.id, scores=[GradedObjectScore(object_id=object_tag.object_id, fraction=Decimal("0.1"))],
@@ -548,13 +524,13 @@ def test_active_criterion_sharing_an_object_tag_is_evaluated(
 ) -> None:
     """Archiving one of two criteria on a shared ObjectTag leaves the other evaluated at its own threshold."""
     child_group = CompetencyCriteriaGroup.objects.create(tag=group.tag, parent=group)
-    archived_criterion = _make_criterion(
+    archived_criterion = make_criterion(
         group=child_group, object_tag=object_tag,
         override=(RuleType.GRADE, {"op": "gte", "value": 0.9, "scale": "percent"}),
     )
     archived_criterion.archived = True
     archived_criterion.save()
-    active_criterion = _make_criterion(group=group, object_tag=object_tag, rule_profile=rule_profile_75)
+    active_criterion = make_criterion(group=group, object_tag=object_tag, rule_profile=rule_profile_75)
 
     # 0.78 meets only the active criterion's 0.75 threshold, not the default 0.8 or the archived 0.9.
     changed = record_graded_object_statuses(
@@ -588,10 +564,10 @@ def test_criterion_archived_with_its_group_is_skipped(
     course_b_object_tag = ObjectTag.objects.create(
         object_id="block-v1:Org1+Python200+Fall2026+problem+p1", taxonomy=object_tag.taxonomy, tag=tag,
     )
-    course_a_criterion = _make_criterion(
+    course_a_criterion = make_criterion(
         group=course_a_group, object_tag=object_tag, rule_profile=default_rule_profile,
     )
-    course_b_criterion = _make_criterion(
+    course_b_criterion = make_criterion(
         group=course_b_group, object_tag=course_b_object_tag, rule_profile=default_rule_profile,
     )
     # A learner status in the course A subtree makes the removal archive it.

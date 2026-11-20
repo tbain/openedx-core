@@ -11,6 +11,7 @@ from rest_framework.test import APIClient
 from openedx_catalog.models import CatalogCourse, CourseRun
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
+    CompetencyCriterion,
     CompetencyMasteryStatus,
     CompetencyRuleProfile,
     CompetencyTaxonomy,
@@ -18,6 +19,8 @@ from openedx_learning.models import (
     RuleType,
 )
 from openedx_tagging.models import ObjectTag, Tag
+
+from .utils import make_criterion
 
 
 @pytest.fixture(name="organization")
@@ -77,6 +80,14 @@ def _default_rule_profile() -> CompetencyRuleProfile:
         course__isnull=True,
         competency_taxonomy__isnull=True,
     )
+
+
+@pytest.fixture(name="criterion")
+def _criterion(
+    group: CompetencyCriteriaGroup, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile
+) -> CompetencyCriterion:
+    """A leaf CompetencyCriterion directly under the root `group`, using the seeded default profile."""
+    return make_criterion(group=group, object_tag=object_tag, rule_profile=default_rule_profile)
 
 
 @pytest.fixture(name="migration_seed_rows")
