@@ -8,7 +8,7 @@ import re
 from typing import ClassVar, Self, cast
 
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
-from django.db import models
+from django.db import connections, models, router, transaction
 from django.db.models import F, Value
 from django.db.models.functions import Concat, Length, Replace, Substr
 from django.utils.functional import cached_property
@@ -75,6 +75,63 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
             .exclude(tag__archived=True)
             .exclude(taxonomy__archived=True)
         )
+
+    def delete(self) -> tuple[int, dict[str, int]]:
+        """
+        Delete these object tags, except that deletion-locked ones are archived instead.
+
+        A deletion-locked object tag is kept in the database with ``archived=True``, because something outside the
+        tagging app depends on it. Archived object tags are counted as deleted in the result, so a caller can't tell
+        which of the two happened.
+
+        :return: Django's ``(total, {model_label: count})`` result, counting archived object tags as deleted.
+        """
+        # A model with a cascading foreign key to ObjectTag makes Django read the rows and then delete them by
+        # primary key, so a `deletion_locked=False` filter would only be checked at read time. Locking the rows
+        # first makes a concurrent lock_object_tags_for_deletion() call wait, find the row gone, and raise
+        # DoesNotExist, instead of locking a row that this transaction then deletes.
+        # No test covers this: it would need two concurrent transactions.
+        row_locking_queryset = self.select_for_update()
+        # A queryset marked for update names the write database as its .db, and still honors an explicit .using().
+        database_alias = row_locking_queryset.db
+        if connections[database_alias].features.has_select_for_update_of:
+            # of=("self",) keeps MySQL and PostgreSQL from also locking the joined Tag and Taxonomy rows, and
+            # MariaDB doesn't support it.
+            row_locking_queryset = row_locking_queryset.select_for_update(of=("self",))
+        write_database_object_tags = self.model.objects.using(database_alias)
+
+        with transaction.atomic(using=database_alias):
+            deletion_locked_by_id = dict(row_locking_queryset.values_list("pk", "deletion_locked"))
+            ids_to_archive = []
+            ids_to_delete = []
+            for object_tag_id, deletion_locked in deletion_locked_by_id.items():
+                if deletion_locked:
+                    ids_to_archive.append(object_tag_id)
+                else:
+                    ids_to_delete.append(object_tag_id)
+
+            archived_count = write_database_object_tags.filter(pk__in=ids_to_archive).update(archived=True)
+            # Call Django's implementation directly, since this method would otherwise recurse into itself.
+            deleted_count, deleted_count_by_model = models.QuerySet.delete(
+                write_database_object_tags.filter(pk__in=ids_to_delete)
+            )
+
+        self._result_cache = None
+        return self._count_archived_as_deleted(archived_count, deleted_count, deleted_count_by_model)
+
+    def _count_archived_as_deleted(
+        self,
+        archived_count: int,
+        deleted_count: int,
+        deleted_count_by_model: dict[str, int],
+    ) -> tuple[int, dict[str, int]]:
+        """
+        Add the number of archived object tags to the result that Django's delete returned.
+        """
+        if archived_count:
+            model_label = self.model._meta.label
+            deleted_count_by_model[model_label] = deleted_count_by_model.get(model_label, 0) + archived_count
+        return deleted_count + archived_count, deleted_count_by_model
 
 
 class Tag(models.Model):
@@ -781,6 +838,9 @@ class ObjectTag(models.Model):
 
     Also, if an ObjectTag is associated with free-text Taxonomy, then the tag's value won't be stored as a standalone
     Tag in the database -- it'll be stored here.
+
+    Calling ``delete()`` on an ObjectTag, or on a queryset of them, archives an object tag that is deletion-locked
+    instead of removing it. The returned counts include archived object tags, and raw SQL bypasses this.
     """
 
     id = models.BigAutoField(primary_key=True)
@@ -865,6 +925,29 @@ class ObjectTag(models.Model):
                 self._export_id = self.taxonomy.export_id
             if not self._value and self.tag:
                 self._value = self.tag.value
+
+    def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
+        """
+        Delete this object tag, or archive it instead if it is deletion-locked.
+
+        A deletion-locked object tag is kept in the database, and ``self.archived`` is set to match. Archiving
+        is counted as a deletion in the result, so a caller can't tell which of the two happened.
+
+        :param using: The database alias to delete from, defaulting to the one Django's router picks for writes.
+        :raises ValueError: If the object tag hasn't been saved.
+        """
+        if self.pk is None:
+            raise ValueError(
+                f"{type(self).__name__} object can't be deleted because its id attribute is set to None."
+            )
+        database_alias = using or router.db_for_write(type(self), instance=self)
+        this_object_tag = type(self).objects.using(database_alias).filter(pk=self.pk)
+        delete_result = this_object_tag.delete()
+        if this_object_tag.exists():
+            self.archived = True
+        else:
+            self.pk = None
+        return delete_result
 
     def __repr__(self):
         """

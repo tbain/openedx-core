@@ -15,6 +15,7 @@ from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
 
 import openedx_tagging.api as tagging_api
+from openedx_tagging.api import _get_current_tags as get_current_tags_unpatched
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
 
 from .test_models import TestTagTaxonomyMixin, get_tag
@@ -491,6 +492,48 @@ class TestApiTagging(TestTagTaxonomyMixin, TestCase):
         object_tag = object_tags[0]
         assert object_tag.taxonomy == new_taxonomy
         assert object_tag.tag == tag
+
+    def test_resync_object_tags_keeps_a_lock_set_after_the_read(self) -> None:
+        """
+        A deletion lock committed after the object tags were read survives a resync of those stale instances.
+        """
+        tagging_api.tag_object("obj1", self.taxonomy, [self.bacteria.value])
+        stale_object_tags = ObjectTag.objects.filter(object_id="obj1").select_related("tag", "taxonomy")
+        # Unpacking evaluates the queryset, so the resync below iterates the instances that were read here.
+        [stale_object_tag] = stale_object_tags
+        tagging_api.lock_object_tags_for_deletion(stale_object_tag.pk)
+        assert stale_object_tag.tag is not None
+        # Changed in memory only, so that resync() sees a difference without enqueuing a celery task.
+        stale_object_tag.tag.value = "Renamed"
+
+        assert tagging_api.resync_object_tags(stale_object_tags) == 1
+
+        assert ObjectTag.objects.get(pk=stale_object_tag.pk).deletion_locked is True
+
+    def test_resync_object_tags_saves_a_renamed_tag_value(self) -> None:
+        """
+        A resync stores a renamed tag's value in the object tag's own cached copy of it.
+        """
+        tagging_api.tag_object("obj1", self.taxonomy, [self.bacteria.value])
+        self.bacteria.value = "Renamed bacteria"
+        self.bacteria.save()
+
+        assert tagging_api.resync_object_tags() == 1
+
+        assert list(ObjectTag.objects.filter(object_id="obj1").values_list("_value", flat=True)) == ["Renamed bacteria"]
+
+    def test_resync_object_tags_saves_a_changed_taxonomy_export_id(self) -> None:
+        """
+        A resync stores a taxonomy's changed export id in the object tag's own cached copy of it.
+        """
+        tagging_api.tag_object("obj1", self.taxonomy, [self.bacteria.value])
+        self.taxonomy.export_id = "renamed_export_id"
+        self.taxonomy.save()
+
+        assert tagging_api.resync_object_tags() == 1
+
+        stored_export_ids = ObjectTag.objects.filter(object_id="obj1").values_list("_export_id", flat=True)
+        assert list(stored_export_ids) == ["renamed_export_id"]
 
     def test_tag_object(self):
         self.taxonomy.allow_multiple = True
@@ -1474,8 +1517,13 @@ class TestDeletionLock(TestTagTaxonomyMixin, TestCase):
         object_tag = self._tag("obj1")
         real_update = QuerySet.update
 
+        object_tag_was_deleted: list[bool] = []
+
         def delete_then_update(queryset: QuerySet[Any], **kwargs: Any) -> int:
-            ObjectTag.objects.filter(pk=object_tag.pk).delete()
+            # Deleting an object tag runs an (empty) update of its own, which must not delete it a second time.
+            if not object_tag_was_deleted:
+                object_tag_was_deleted.append(True)
+                ObjectTag.objects.filter(pk=object_tag.pk).delete()
             return real_update(queryset, **kwargs)
 
         with patch.object(QuerySet, "update", delete_then_update):
@@ -1579,3 +1627,321 @@ class TestDeletionLock(TestTagTaxonomyMixin, TestCase):
         ObjectTag.objects.filter(pk=object_tag.pk).update(archived=True)
         assert tagging_api.get_tags_locked_for_deletion([self.mammalia.pk]) == {self.mammalia.pk}
         assert tagging_api.is_taxonomy_locked_for_deletion(self.taxonomy.pk)
+
+
+@ddt.ddt
+class TestArchiveLockedObjectTags(TestTagTaxonomyMixin, TestCase):
+    """
+    Tests that deleting a deletion-locked ObjectTag archives it, and that re-applying the tag un-archives it.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.taxonomy.allow_multiple = True
+        self.taxonomy.save()
+
+    def _apply(self, object_id: str, values: list[str], taxonomy: Taxonomy | None = None) -> None:
+        tagging_api.tag_object(object_id=object_id, taxonomy=taxonomy or self.taxonomy, tags=values)
+
+    def _object_tag(self, object_id: str, value: str, taxonomy: Taxonomy | None = None) -> ObjectTag:
+        return ObjectTag.objects.get(object_id=object_id, taxonomy=taxonomy or self.taxonomy, _value=value)
+
+    def _locked(self, object_id: str, value: str, taxonomy: Taxonomy | None = None) -> ObjectTag:
+        object_tag = self._object_tag(object_id, value, taxonomy)
+        tagging_api.lock_object_tags_for_deletion(object_tag.pk)
+        return self._object_tag(object_id, value, taxonomy)
+
+    def _query_count(self, func, *args) -> int:
+        with CaptureQueriesContext(connection) as queries:
+            func(*args)
+        return len(queries)
+
+    @ddt.data("taxonomy", "free_text_taxonomy")
+    def test_tag_object_archives_locked_and_reapply_restores(self, taxonomy_attr: str) -> None:
+        """
+        AC: replacing tags archives the locked association and deletes the unlocked one; re-applying restores the row.
+        """
+        taxonomy = getattr(self, taxonomy_attr)
+        self._apply("obj1", ["Mammalia", "Fungi"], taxonomy)
+        locked = self._locked("obj1", "Mammalia", taxonomy)
+        unlocked_pk = self._object_tag("obj1", "Fungi", taxonomy).pk
+
+        self._apply("obj1", ["Archaea"], taxonomy)
+
+        archived = ObjectTag.objects.get(pk=locked.pk)
+        assert archived.archived is True
+        assert archived.deletion_locked is True
+        assert not ObjectTag.objects.filter(pk=unlocked_pk).exists()
+        assert self._object_tag("obj1", "Archaea", taxonomy).archived is False
+        assert [t.value for t in tagging_api.get_object_tags("obj1")] == ["Archaea"]
+
+        # The lowercase re-apply is deliberate: the unique constraint is case-insensitive, so it must still match.
+        self._apply("obj1", ["mammalia"], taxonomy)
+
+        reapplied = self._object_tag("obj1", "Mammalia", taxonomy)
+        assert reapplied.pk == locked.pk
+        assert reapplied.archived is False
+        assert reapplied.deletion_locked is True
+        assert reapplied.value == ("mammalia" if taxonomy.allow_free_text else "Mammalia")
+        assert ObjectTag.objects.filter(object_id="obj1", _value="Mammalia").count() == 1
+
+    def test_delete_object_tags_archives_locked_and_reimport_restores(self) -> None:
+        """
+        AC: deleting a content object archives its locked tag and deletes the other; re-import restores the same row.
+        """
+        self._apply("obj1", ["Mammalia", "Fungi"])
+        locked = self._locked("obj1", "Mammalia")
+        unlocked_pk = self._object_tag("obj1", "Fungi").pk
+
+        tagging_api.delete_object_tags("obj1")
+
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+        assert not ObjectTag.objects.filter(pk=unlocked_pk).exists()
+        assert not tagging_api.get_object_tags("obj1").exists()
+
+        self._apply("obj1", ["Mammalia"])
+
+        reimported = self._object_tag("obj1", "Mammalia")
+        assert reimported.pk == locked.pk
+        assert reimported.archived is False
+        assert reimported.deletion_locked is True
+
+    @ddt.data("taxonomy", "free_text_taxonomy")
+    def test_copy_tags_archives_dropped_locked_copy_and_keeps_shared_one(self, taxonomy_attr: str) -> None:
+        """
+        AC: library sync archives a locked copy the source dropped and keeps one it still has; never copies archived.
+        """
+        taxonomy = getattr(self, taxonomy_attr)
+        self._apply("source", ["Mammalia", "Fungi"], taxonomy)
+        tagging_api.copy_tags("source", "dest")
+        kept = self._locked("dest", "Mammalia", taxonomy)
+        dropped = self._locked("dest", "Fungi", taxonomy)
+        self._apply("source", ["Mammalia", "Archaea", "Chordata"], taxonomy)
+        ObjectTag.objects.filter(object_id="source", _value="Chordata").update(archived=True)
+
+        tagging_api.copy_tags("source", "dest")
+
+        still_kept = self._object_tag("dest", "Mammalia", taxonomy)
+        assert still_kept.pk == kept.pk
+        assert still_kept.archived is False
+        assert still_kept.is_copied is True
+        assert still_kept.deletion_locked is True
+        assert ObjectTag.objects.get(pk=dropped.pk).archived is True
+        copied = self._object_tag("dest", "Archaea", taxonomy)
+        assert copied.is_copied is True
+        assert copied.archived is False
+        assert not ObjectTag.objects.filter(object_id="dest", _value="Chordata").exists()
+
+    @ddt.data("known_taxonomy", "no_taxonomy")
+    def test_reimport_restores_unresolved_association(self, case: str) -> None:
+        """
+        AC: re-import restores the same row for an association whose tag can't be resolved.
+        """
+        taxonomy = self.taxonomy if case == "known_taxonomy" else None
+        kwargs: dict[str, Any] = {"create_invalid": True} if taxonomy else {"taxonomy_export_id": "unknown_taxonomy"}
+        tagging_api.tag_object("obj1", taxonomy, ["Not a real tag"], **kwargs)
+        unresolved = ObjectTag.objects.get(object_id="obj1")
+        tagging_api.lock_object_tags_for_deletion(unresolved.pk)
+
+        tagging_api.delete_object_tags("obj1")
+        assert ObjectTag.objects.get(pk=unresolved.pk).archived is True
+        tagging_api.tag_object("obj1", taxonomy, ["Not a real tag"], **kwargs)
+
+        reimported = ObjectTag.objects.get(object_id="obj1")
+        assert reimported.pk == unresolved.pk
+        assert reimported.archived is False
+        assert reimported.deletion_locked is True
+
+    def test_archived_object_tags_do_not_count_toward_tag_limit(self) -> None:
+        """
+        Archived object tags don't count toward OBJECT_MAX_TAGS, with or without a taxonomy.
+        """
+        with patch("openedx_tagging.api.OBJECT_MAX_TAGS", 2):
+            self._apply("obj1", ["Mammalia", "Fungi"])
+            for value in ("Mammalia", "Fungi"):
+                self._locked("obj1", value)
+            self._apply("obj1", [])
+            assert ObjectTag.objects.filter(object_id="obj1", archived=True).count() == 2
+
+            self._apply("obj1", ["one", "two"], self.free_text_taxonomy)
+
+            with pytest.raises(ValueError, match="Cannot add more than 2 tags"):
+                self._apply("obj1", ["Tag 4"], self.import_taxonomy)
+
+            tagging_api.tag_object("obj2", None, ["first", "second"], taxonomy_export_id="gone")
+            for object_tag in ObjectTag.objects.filter(object_id="obj2"):
+                tagging_api.lock_object_tags_for_deletion(object_tag.pk)
+            tagging_api.tag_object("obj2", None, [], taxonomy_export_id="gone")
+            assert ObjectTag.objects.filter(object_id="obj2", archived=True).count() == 2
+
+            tagging_api.tag_object("obj2", None, ["third", "fourth"], taxonomy_export_id="other")
+
+            with pytest.raises(ValueError, match="Cannot add more than 2 tags"):
+                tagging_api.tag_object("obj2", None, ["fifth"], taxonomy_export_id="another")
+
+    @ddt.data(("Alpha", "alpha"), ("ß", "ss"), ("café", "cafe"))
+    @ddt.unpack
+    def test_applying_value_restores_archived_object_tag_only_if_database_treats_it_as_equal(
+        self, first: str, second: str
+    ) -> None:
+        """
+        An archived free-text object tag is restored by a differently spelled value only if the database treats the
+        two spellings as equal; otherwise the archived object tag is left alone and a new one is created.
+
+        The database decides, because the unique constraint on the value uses its collation. MySQL, for example,
+        treats "Alpha" and "alpha" as equal, and SQLite doesn't.
+        """
+        taxonomy = self.free_text_taxonomy
+        self._apply("obj1", [first], taxonomy)
+        locked = self._locked("obj1", first, taxonomy)
+        self._apply("obj1", [], taxonomy)
+        database_treats_values_as_equal = ObjectTag.objects.filter(pk=locked.pk, _value=second).exists()
+
+        self._apply("obj1", [second], taxonomy)
+
+        if database_treats_values_as_equal:
+            restored = ObjectTag.objects.get(object_id="obj1")
+            assert restored.pk == locked.pk
+            assert restored.value == second
+            assert restored.archived is False
+            assert restored.deletion_locked is True
+        else:
+            still_archived = ObjectTag.objects.get(pk=locked.pk)
+            assert still_archived.value == first
+            assert still_archived.archived is True
+            new_object_tag = ObjectTag.objects.get(object_id="obj1", archived=False)
+            assert new_object_tag.pk != locked.pk
+            assert new_object_tag.value == second
+            assert new_object_tag.deletion_locked is False
+
+    def test_applying_value_without_taxonomy_keeps_the_deletion_locked_object_tag(self) -> None:
+        """
+        When several object tags have an equal value, applying it keeps the deletion-locked one and removes the others.
+        """
+        kwargs: dict[str, Any] = {"taxonomy_export_id": "gone"}
+        tagging_api.tag_object("obj1", None, ["Alpha", "alpha"], **kwargs)  # No unique constraint without a taxonomy
+        assert ObjectTag.objects.filter(object_id="obj1").count() == 2
+        # Pick by exact spelling in Python, since filtering on _value would match both rows.
+        both_object_tags = ObjectTag.objects.filter(object_id="obj1")
+        locked = next(object_tag for object_tag in both_object_tags if object_tag.value == "alpha")
+        tagging_api.lock_object_tags_for_deletion(locked.pk)
+
+        tagging_api.tag_object("obj1", None, ["ALPHA"], **kwargs)
+
+        restored = ObjectTag.objects.get(object_id="obj1")
+        assert restored.pk == locked.pk
+        assert restored.value == "ALPHA"
+        assert restored.archived is False
+        assert restored.deletion_locked is True
+
+    def test_applying_value_without_taxonomy_keeps_the_oldest_object_tag_if_none_is_locked(self) -> None:
+        """
+        When several unlocked object tags have an equal value, applying it keeps the one with the lowest id.
+        """
+        kwargs: dict[str, Any] = {"taxonomy_export_id": "gone"}
+        tagging_api.tag_object("obj1", None, ["Alpha", "alpha"], **kwargs)  # No unique constraint without a taxonomy
+        lowest_id = ObjectTag.objects.filter(object_id="obj1").order_by("pk")[0].pk
+
+        tagging_api.tag_object("obj1", None, ["ALPHA"], **kwargs)
+
+        kept = ObjectTag.objects.get(object_id="obj1")
+        assert kept.pk == lowest_id
+        assert kept.value == "ALPHA"
+
+    def test_reapply_two_values_for_one_row_fails_atomically(self) -> None:
+        """
+        Two values that the database treats as equal can't both be applied, and nothing is written.
+        """
+        self._apply("obj1", ["Alpha"], self.free_text_taxonomy)
+        locked = self._locked("obj1", "Alpha", self.free_text_taxonomy)
+        self._apply("obj1", [], self.free_text_taxonomy)
+
+        with pytest.raises(ValidationError):
+            self._apply("obj1", ["Alpha", "alpha"], self.free_text_taxonomy)
+
+        only_row = ObjectTag.objects.get(object_id="obj1")
+        assert only_row.pk == locked.pk
+        assert only_row.value == "Alpha"
+        assert only_row.archived is True
+
+    def test_reapplying_with_stale_value_ends_unarchived(self) -> None:
+        """Re-applying an archived row whose _value is out of date still ends unarchived in the database."""
+        self._apply("obj1", ["Mammalia"])
+        locked = self._locked("obj1", "Mammalia")
+        self._apply("obj1", [])
+        self.taxonomy.update_tag("Mammalia", "Therians")  # Unlike the API function, this doesn't resync ObjectTags
+        assert ObjectTag.objects.filter(pk=locked.pk, _value="Mammalia").exists()  # The cached value is stale now
+
+        self._apply("obj1", ["Therians"])
+
+        reapplied = ObjectTag.objects.get(pk=locked.pk)
+        assert reapplied.archived is False
+        assert reapplied.value == "Therians"
+        assert reapplied.deletion_locked is True
+
+    def test_tag_object_query_count_is_constant(self) -> None:
+        """`tag_object()` removing a mixed set of tags runs the same queries however many tags it removes."""
+        counts = []
+        for object_id, size in (("small", 2), ("large", 20)):
+            values = [f"{object_id} {index}" for index in range(size)]
+            self._apply(object_id, values, self.free_text_taxonomy)
+            for value in values[::2]:
+                self._locked(object_id, value, self.free_text_taxonomy)
+            counts.append(self._query_count(self._apply, object_id, [], self.free_text_taxonomy))
+        assert counts[0] == counts[1]
+
+    def test_applying_a_dropped_copy_again_makes_it_author_owned(self) -> None:
+        """
+        An archived copied object tag that is applied again becomes author-owned, so library sync leaves it alone.
+        """
+        self._apply("source", ["Mammalia"])
+        tagging_api.copy_tags("source", "dest")
+        locked = self._locked("dest", "Mammalia")
+        self._apply("source", [])
+        tagging_api.copy_tags("source", "dest")
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+
+        self._apply("dest", ["Mammalia"])
+
+        restored = ObjectTag.objects.get(pk=locked.pk)
+        assert restored.archived is False
+        assert restored.is_copied is False
+        tagging_api.copy_tags("source", "dest")
+        assert ObjectTag.objects.get(pk=locked.pk).archived is False
+
+    def test_save_does_not_overwrite_a_lock_committed_after_reading(self) -> None:
+        """
+        A lock committed after `tag_object()` read an object tag survives, because only the changed columns are saved.
+        """
+        taxonomy = self.free_text_taxonomy
+        self._apply("obj1", ["Alpha"], taxonomy)
+        original_get_current_tags = get_current_tags_unpatched
+
+        def read_then_lock_in_database(*args: Any, **kwargs: Any) -> list[ObjectTag]:
+            existing_object_tags = original_get_current_tags(*args, **kwargs)
+            ObjectTag.objects.filter(object_id="obj1").update(deletion_locked=True)
+            return existing_object_tags
+
+        with patch("openedx_tagging.api._get_current_tags", read_then_lock_in_database):
+            self._apply("obj1", ["alpha"], taxonomy)
+
+        saved = ObjectTag.objects.get(object_id="obj1")
+        assert saved.value == "alpha"
+        assert saved.deletion_locked is True
+
+    def test_copy_tags_stores_the_spelling_of_the_source(self) -> None:
+        """
+        A restored copied free-text object tag takes the source's current spelling.
+        """
+        taxonomy = self.free_text_taxonomy
+        self._apply("source", ["Alpha"], taxonomy)
+        tagging_api.copy_tags("source", "dest")
+        locked = self._locked("dest", "Alpha", taxonomy)
+        self._apply("source", ["alpha"], taxonomy)
+
+        tagging_api.copy_tags("source", "dest")
+
+        copied = ObjectTag.objects.get(object_id="dest")
+        assert copied.pk == locked.pk
+        assert copied.value == "alpha"
+        assert copied.archived is False

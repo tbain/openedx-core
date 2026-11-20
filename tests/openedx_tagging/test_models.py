@@ -13,6 +13,7 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.utils import IntegrityError
+from django.test import override_settings
 from django.test.testcases import TestCase
 
 from openedx_tagging import api
@@ -1319,3 +1320,116 @@ class TestTagExternalIdGeneration(TestTagTaxonomyMixin, TestCase):
             read_only_taxonomy.update_tag("RO Tag", "Renamed")
         with pytest.raises(ValueError):
             read_only_taxonomy.delete_tags(["RO Tag"])
+
+
+class ReplicaRouter:
+    """
+    Sends reads to a database alias that isn't configured, and writes to the default one.
+    """
+
+    def db_for_read(self, _model, **_hints):
+        return "replica"
+
+    def db_for_write(self, _model, **_hints):
+        return "default"
+
+
+class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
+    """
+    Test that deleting ObjectTags archives deletion-locked ones instead of removing them.
+    """
+
+    def _object_tag(self, object_id: str, value: str, locked: bool = False) -> ObjectTag:
+        return ObjectTag.objects.create(
+            object_id=object_id,
+            taxonomy=self.free_text_taxonomy,
+            _value=value,
+            deletion_locked=locked,
+        )
+
+    def test_direct_deletes_archive_locked_rows(self) -> None:
+        """
+        AC: instance and bulk deletes archive locked rows, remove unlocked ones, and return the same shape for both.
+        """
+        label = ObjectTag._meta.label
+        locked = self._object_tag("obj1", "locked", locked=True)
+
+        assert locked.delete() == (1, {label: 1})
+
+        assert locked.archived is True
+        assert locked.pk is not None
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+
+        unlocked = self._object_tag("obj2", "unlocked")
+        pk = unlocked.pk
+
+        assert unlocked.delete() == (1, {label: 1})
+
+        assert unlocked.pk is None
+        assert not ObjectTag.objects.filter(pk=pk).exists()
+
+        bulk_locked = self._object_tag("obj3", "locked", locked=True)
+        bulk_unlocked = self._object_tag("obj3", "unlocked")
+
+        bulk = ObjectTag.objects.filter(object_id="obj3")
+        assert len(list(bulk)) == 2  # Evaluate it, so the delete has a result cache to clear
+
+        assert bulk.delete() == (2, {label: 2})
+
+        assert [(t.pk, t.archived) for t in bulk] == [(bulk_locked.pk, True)]
+        assert not ObjectTag.objects.filter(pk=bulk_unlocked.pk).exists()
+
+    def test_deleting_an_unsaved_object_tag_raises(self) -> None:
+        """
+        Deleting an object tag that was never saved raises the same error as Django's own `Model.delete()`.
+        """
+        unsaved = ObjectTag(object_id="obj1", taxonomy=self.free_text_taxonomy, _value="value")
+        with pytest.raises(ValueError, match="can't be deleted because its id attribute is set to None"):
+            unsaved.delete()
+
+    def test_bulk_delete_of_only_locked_or_only_unlocked_object_tags(self) -> None:
+        """
+        A bulk delete returns the right counts when every object tag is locked, and when none is.
+        """
+        label = ObjectTag._meta.label
+        self._object_tag("obj1", "locked one", locked=True)
+        self._object_tag("obj1", "locked two", locked=True)
+        self._object_tag("obj2", "unlocked")
+
+        assert ObjectTag.objects.filter(object_id="obj1").delete() == (2, {label: 2})
+        assert ObjectTag.objects.filter(object_id="obj2").delete() == (1, {label: 1})
+        assert ObjectTag.objects.filter(object_id="nothing here").delete() == (0, {})
+        assert ObjectTag.objects.filter(object_id="obj1", archived=True).count() == 2
+        assert not ObjectTag.objects.filter(object_id="obj2").exists()
+
+    def test_bulk_delete_uses_write_database(self) -> None:
+        """
+        A bulk delete locks, archives and deletes on the write database, never the read one.
+        """
+        locked = self._object_tag("obj1", "locked", locked=True)
+        unlocked = self._object_tag("obj1", "unlocked")
+
+        # The read alias isn't configured, so any query routed to it would raise.
+        with override_settings(DATABASE_ROUTERS=[ReplicaRouter()]):
+            result = ObjectTag.objects.filter(object_id="obj1").delete()
+
+        assert result == (2, {ObjectTag._meta.label: 2})
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+        assert not ObjectTag.objects.filter(pk=unlocked.pk).exists()
+
+    def test_instance_delete_uses_write_database(self) -> None:
+        """
+        Deleting an object tag instance locks, archives and deletes on the write database, never the read one.
+        """
+        locked = self._object_tag("obj1", "locked", locked=True)
+        unlocked = self._object_tag("obj1", "unlocked")
+
+        # The read alias isn't configured, so any query routed to it would raise.
+        with override_settings(DATABASE_ROUTERS=[ReplicaRouter()]):
+            locked_result = locked.delete()
+            unlocked_result = unlocked.delete()
+
+        assert locked_result == (1, {ObjectTag._meta.label: 1})
+        assert unlocked_result == (1, {ObjectTag._meta.label: 1})
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+        assert unlocked.pk is None
