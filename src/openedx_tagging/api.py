@@ -217,7 +217,9 @@ def resync_object_tags(object_tags: QuerySet | None = None) -> int:
     for object_tag in object_tags:
         changed = object_tag.resync()
         if changed:
-            object_tag.save()
+            # These rows were read before this save, so a `deletion_locked` committed in between must not be
+            # overwritten with the stale value. Only the columns that `resync()` can change are written.
+            object_tag.save(update_fields=["_export_id", "taxonomy", "tag", "_value"])
             num_changed += 1
 
     return num_changed

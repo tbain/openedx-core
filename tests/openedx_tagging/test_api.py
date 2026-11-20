@@ -493,6 +493,20 @@ class TestApiTagging(TestTagTaxonomyMixin, TestCase):
         assert object_tag.taxonomy == new_taxonomy
         assert object_tag.tag == tag
 
+    def test_resync_object_tags_keeps_a_lock_set_after_the_read(self) -> None:
+        """
+        A deletion lock committed after the object tags were read survives a resync of those stale instances.
+        """
+        tagging_api.tag_object("obj1", self.taxonomy, [self.bacteria.value])
+        stale_list = list(ObjectTag.objects.filter(object_id="obj1").select_related("tag", "taxonomy"))
+        tagging_api.lock_object_tags_for_deletion(stale_list[0].pk)
+        # Changed in memory only, so that resync() sees a difference without enqueuing a celery task.
+        stale_list[0].tag.value = "Renamed"
+
+        assert tagging_api.resync_object_tags(stale_list) == 1
+
+        assert ObjectTag.objects.get(pk=stale_list[0].pk).deletion_locked is True
+
     def test_tag_object(self):
         self.taxonomy.allow_multiple = True
 
