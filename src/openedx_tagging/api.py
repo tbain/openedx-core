@@ -321,15 +321,26 @@ def get_object_tag_counts(object_id_pattern: str, count_implicit=False) -> dict[
         return {row["object_id"]: row["num_tags"] for row in qs}
 
 
-def delete_object_tags(object_id: str):
+def delete_object_tags(object_id: str, *, keep_hidden: bool = False) -> None:
     """
-    Delete all ObjectTag entries for a given object.
+    Delete the ObjectTag entries for a given object.
 
-    Deletion-locked object tags are archived instead of deleted.
+    Deletion-locked object tags are archived instead of deleted, whatever ``keep_hidden`` is.
+
+    :param object_id: The object whose object tags are deleted.
+    :param keep_hidden: If False, all of the object's object tags are deleted, including archived ones and ones whose
+        tag or taxonomy is archived. If True, only the object tags that :meth:`ObjectTagQuerySet.unarchived` returns
+        are deleted, and the hidden ones are left untouched: they are not deleted, not archived again, and their
+        ``deletion_locked`` value is unchanged.
     """
-    tags = ObjectTag.objects.filter(object_id=object_id)
+    if not keep_hidden:
+        ObjectTag.objects.filter(object_id=object_id).delete()
+        return
 
-    tags.delete()
+    pks = list(ObjectTag.objects.filter(object_id=object_id).unarchived().values_list("pk", flat=True))
+    # Delete by primary key: the queryset delete locks the rows it selects, and unarchived() joins the tag and taxonomy
+    # tables, so deleting the joined queryset would lock shared tag and taxonomy rows on MariaDB.
+    ObjectTag.objects.filter(pk__in=pks).delete()
 
 
 def _check_new_tag_count(
@@ -589,6 +600,9 @@ def tag_object(
     Applying a tag whose object tag is archived restores that same row, and leaves its ``deletion_locked``
     unchanged. Omitted object tags that are deletion-locked are archived instead of deleted. A restored free-text
     value is stored with the newly applied spelling.
+    Omitted object tags that are archived, or whose tag or taxonomy is archived (the ones
+    :meth:`ObjectTagQuerySet.unarchived` excludes), are left alone, because a caller that builds its list from the
+    filtered read paths never saw them.
     """
     if not isinstance(tags, list):
         raise ValueError(_("Tags must be a list, not {type}.").format(type=type(tags).__name__))
@@ -654,8 +668,17 @@ def tag_object(
                     )
                     object_tags_to_create.append(object_tag)
 
-    # Whatever is left in `existing_object_tags` was not asked for, so it is removed from the object.
-    _save_object_tags(existing_object_tags, object_tags_to_update, object_tags_to_create)
+    # Whatever is left in `existing_object_tags` was not asked for. The read paths hide a row that is archived, or
+    # whose tag or taxonomy is archived, so a caller that builds its list from them never saw such a row, and removing
+    # it would delete or re-archive something the caller can't see. Only the rows that `unarchived()` returns are
+    # removed. A row hidden for another reason, such as a disabled taxonomy, is still removed.
+    active_pks = set(
+        ObjectTag.objects.filter(pk__in=[object_tag.pk for object_tag in existing_object_tags])
+        .unarchived()
+        .values_list("pk", flat=True)
+    )
+    object_tags_to_remove = [object_tag for object_tag in existing_object_tags if object_tag.pk in active_pks]
+    _save_object_tags(object_tags_to_remove, object_tags_to_update, object_tags_to_create)
 
 
 def add_tag_to_object(object_id: str, tag: Tag) -> ObjectTag:
