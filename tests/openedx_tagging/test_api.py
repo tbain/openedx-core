@@ -507,6 +507,31 @@ class TestApiTagging(TestTagTaxonomyMixin, TestCase):
 
         assert ObjectTag.objects.get(pk=stale_list[0].pk).deletion_locked is True
 
+    def test_resync_object_tags_saves_a_renamed_tag_value(self) -> None:
+        """
+        A resync stores a renamed tag's value in the object tag's own cached copy of it.
+        """
+        tagging_api.tag_object("obj1", self.taxonomy, [self.bacteria.value])
+        self.bacteria.value = "Renamed bacteria"
+        self.bacteria.save()
+
+        assert tagging_api.resync_object_tags() == 1
+
+        assert list(ObjectTag.objects.filter(object_id="obj1").values_list("_value", flat=True)) == ["Renamed bacteria"]
+
+    def test_resync_object_tags_saves_a_changed_taxonomy_export_id(self) -> None:
+        """
+        A resync stores a taxonomy's changed export id in the object tag's own cached copy of it.
+        """
+        tagging_api.tag_object("obj1", self.taxonomy, [self.bacteria.value])
+        self.taxonomy.export_id = "renamed_export_id"
+        self.taxonomy.save()
+
+        assert tagging_api.resync_object_tags() == 1
+
+        stored_export_ids = ObjectTag.objects.filter(object_id="obj1").values_list("_export_id", flat=True)
+        assert list(stored_export_ids) == ["renamed_export_id"]
+
     def test_tag_object(self):
         self.taxonomy.allow_multiple = True
 
