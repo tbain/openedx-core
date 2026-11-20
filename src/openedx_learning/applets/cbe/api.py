@@ -21,7 +21,7 @@ from opaque_keys.edx.keys import CourseKey, UsageKey
 from openedx_catalog.api import get_course_run, get_course_run_ids
 from openedx_catalog.models_api import CourseRun
 from openedx_tagging import api as tagging_api
-from openedx_tagging.api import create_taxonomy, get_ancestor_tags, get_descendant_tags
+from openedx_tagging.api import create_taxonomy, get_ancestor_tags, get_descendant_tags, lock_object_tags_for_deletion
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
 from openedx_tagging.rules import ObjectTagPermissionItem, UserType
 
@@ -928,8 +928,8 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
     """
     Record a learner's leaf-level competency status for each graded object in ``scores``.
 
-    UNSTABLE: the rollup and learner-status read entry points still to come may change what this
-    function returns without a deprecation cycle.
+    UNSTABLE: the rollup and learner-status read entry points still to come may change this function's
+    behavior or what it returns without a deprecation cycle.
 
     Call this only from inside the same transaction that also writes the grade: this function opens
     no transaction of its own and lets any storage error propagate rather than swallowing it, so the
@@ -946,7 +946,13 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
     primary-key order within one call, and two calls in one transaction would form two ascending runs
     that can deadlock with a concurrent bulk update.
 
+    The tag association (``ObjectTag``) behind each evaluated criterion is locked against deletion before any
+    status is written, in the same transaction, so that a later removal archives it instead of deleting it.
+    The lock is permanent.
+
     :raises TransactionManagementError: if called outside an atomic block.
+    :raises ObjectTag.DoesNotExist: if a tag association behind an evaluated criterion is removed while this
+        function runs. No status is written, and retrying the grade write is safe.
     """
     # In autocommit mode get_or_create() would commit a leaf row on its own, apart from the grade.
     if not connection.in_atomic_block:
@@ -970,8 +976,7 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
         .order_by("pk")
     )
 
-    now = datetime.now(tz=timezone.utc)
-    changed = 0
+    evaluated: list[tuple[CompetencyCriterion, MasteryStatus]] = []
     for criterion in criteria:
         fraction = fraction_by_object_id[criterion.object_tag.object_id]
         rule_type, payload = _effective_rule(criterion)
@@ -984,13 +989,21 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
             )
             continue
         status = MasteryStatus.DEMONSTRATED if demonstrated else MasteryStatus.ATTEMPTED_NOT_DEMONSTRATED
+        evaluated.append((criterion, status))
+
+    # A tag removal locks the association before it deletes the criteria beneath it, so this lock has to be taken
+    # before the first status row, which holds its criterion until commit. The other order can deadlock.
+    lock_object_tags_for_deletion({criterion.object_tag_id for criterion, _ in evaluated})
+
+    now = datetime.now(tz=timezone.utc)
+    changed = 0
+    for criterion, status in evaluated:
         changed += raise_status(
             StudentCompetencyCriterionStatus.objects,
             lookup={"user_id": user_id, "criterion_id": criterion.pk},
             status=status,
             now=now,
         )
-
     return changed
 
 
