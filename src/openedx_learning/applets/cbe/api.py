@@ -976,7 +976,7 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
         .order_by("pk")
     )
 
-    evaluated: list[tuple[CompetencyCriterion, MasteryStatus]] = []
+    criteria_and_statuses_to_record: list[tuple[CompetencyCriterion, MasteryStatus]] = []
     for criterion in criteria:
         fraction = fraction_by_object_id[criterion.object_tag.object_id]
         rule_type, payload = _effective_rule(criterion)
@@ -989,15 +989,15 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
             )
             continue
         status = MasteryStatus.DEMONSTRATED if demonstrated else MasteryStatus.ATTEMPTED_NOT_DEMONSTRATED
-        evaluated.append((criterion, status))
+        criteria_and_statuses_to_record.append((criterion, status))
 
     # A tag removal locks the association before it deletes the criteria beneath it, so this lock has to be taken
     # before the first status row, which holds its criterion until commit. The other order can deadlock.
-    lock_object_tags_for_deletion({criterion.object_tag_id for criterion, _ in evaluated})
+    lock_object_tags_for_deletion({criterion.object_tag_id for criterion, _ in criteria_and_statuses_to_record})
 
     now = datetime.now(tz=timezone.utc)
     changed = 0
-    for criterion, status in evaluated:
+    for criterion, status in criteria_and_statuses_to_record:
         changed += raise_status(
             StudentCompetencyCriterionStatus.objects,
             lookup={"user_id": user_id, "criterion_id": criterion.pk},

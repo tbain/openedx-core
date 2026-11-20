@@ -33,14 +33,14 @@ from .utils import make_criterion
 pytestmark = pytest.mark.django_db
 
 
-def _score(object_tag: ObjectTag) -> GradedObjectScore:
+def _passing_score(object_tag: ObjectTag) -> GradedObjectScore:
     """A passing score for the object behind `object_tag`."""
     return GradedObjectScore(object_id=object_tag.object_id, fraction=Decimal("0.9"))
 
 
 @pytest.mark.usefixtures("criterion")
 def test_recording_a_status_locks_the_criterion_object_tag(user, object_tag: ObjectTag) -> None:
-    record_graded_object_statuses(user_id=user.id, scores=[_score(object_tag)])
+    record_graded_object_statuses(user_id=user.id, scores=[_passing_score(object_tag)])
 
     object_tag.refresh_from_db()
     assert object_tag.deletion_locked is True
@@ -49,10 +49,10 @@ def test_recording_a_status_locks_the_criterion_object_tag(user, object_tag: Obj
 def test_second_learner_on_locked_association_succeeds_and_keeps_lock(
     user, criterion: CompetencyCriterion, object_tag: ObjectTag
 ) -> None:
-    record_graded_object_statuses(user_id=user.id, scores=[_score(object_tag)])
+    record_graded_object_statuses(user_id=user.id, scores=[_passing_score(object_tag)])
     second_user = get_user_model().objects.create(username="learner2")
 
-    changed = record_graded_object_statuses(user_id=second_user.id, scores=[_score(object_tag)])
+    changed = record_graded_object_statuses(user_id=second_user.id, scores=[_passing_score(object_tag)])
 
     assert changed == 1
     assert StudentCompetencyCriterionStatus.objects.filter(criterion=criterion, user_id=second_user.id).exists()
@@ -67,7 +67,7 @@ def test_tagged_content_with_no_criteria_locks_nothing(user, competency_taxonomy
         object_id="block-v1:Org1+Python100+Fall2026+problem+none", taxonomy=competency_taxonomy, tag=tag,
     )
 
-    changed = record_graded_object_statuses(user_id=user.id, scores=[_score(object_tag)])
+    changed = record_graded_object_statuses(user_id=user.id, scores=[_passing_score(object_tag)])
 
     assert changed == 0
     object_tag.refresh_from_db()
@@ -96,7 +96,7 @@ def test_unappliable_rule_leaves_association_unlocked(
     )
     CompetencyCriterion.objects.filter(pk=bad_criterion.pk).update(**corrupt_kwargs)
 
-    changed = record_graded_object_statuses(user_id=user.id, scores=[_score(bad_object_tag)])
+    changed = record_graded_object_statuses(user_id=user.id, scores=[_passing_score(bad_object_tag)])
 
     assert changed == 0
     bad_object_tag.refresh_from_db()
@@ -117,17 +117,17 @@ def test_lock_is_one_bulk_call_regardless_of_criteria_count(
             rule_profile=default_rule_profile,
         )
 
-    with CaptureQueriesContext(connection) as captured:
+    with CaptureQueriesContext(connection) as query_capture:
         changed = record_graded_object_statuses(
             user_id=user.id, scores=[GradedObjectScore(object_id=object_id, fraction=Decimal("0.9"))],
         )
 
     assert changed == criteria_count
-    lock_updates = [
-        query["sql"] for query in captured.captured_queries
+    lock_update_queries = [
+        query["sql"] for query in query_capture.captured_queries
         if "oel_tagging_objecttag" in query["sql"] and "UPDATE" in query["sql"].upper()
     ]
-    assert len(lock_updates) == 1
+    assert len(lock_update_queries) == 1
     assert ObjectTag.objects.filter(object_id=object_id, deletion_locked=True).count() == criteria_count
 
 
@@ -140,7 +140,7 @@ def test_rolled_back_status_write_leaves_nothing_locked(
         """Raised deliberately to force the enclosing transaction to roll back."""
 
     with pytest.raises(_BoomError), transaction.atomic():
-        record_graded_object_statuses(user_id=user.id, scores=[_score(object_tag)])
+        record_graded_object_statuses(user_id=user.id, scores=[_passing_score(object_tag)])
         assert ObjectTag.objects.values_list("deletion_locked", flat=True).get(pk=object_tag.pk) is True
         raise _BoomError()
 
@@ -161,7 +161,7 @@ def test_association_removed_before_the_lock_raises_and_writes_no_status(user, o
         "openedx_learning.applets.cbe.api.lock_object_tags_for_deletion", side_effect=remove_then_lock
     ):
         with pytest.raises(ObjectTag.DoesNotExist):
-            record_graded_object_statuses(user_id=user.id, scores=[_score(object_tag)])
+            record_graded_object_statuses(user_id=user.id, scores=[_passing_score(object_tag)])
 
     assert not StudentCompetencyCriterionStatus.objects.filter(user_id=user.id).exists()
 
@@ -174,7 +174,7 @@ def test_criterion_whose_status_already_exists_is_still_locked(
     )
     assert object_tag.deletion_locked is False
 
-    changed = record_graded_object_statuses(user_id=user.id, scores=[_score(object_tag)])
+    changed = record_graded_object_statuses(user_id=user.id, scores=[_passing_score(object_tag)])
 
     assert changed == 0
     object_tag.refresh_from_db()
@@ -185,7 +185,7 @@ def test_deleting_locked_association_archives_it_and_protects_tag_and_taxonomy(
     user, criterion: CompetencyCriterion, object_tag: ObjectTag, tag: Tag, competency_taxonomy: CompetencyTaxonomy
 ) -> None:
     """Deleting a locked association archives it, protects its tag and taxonomy, and keeps the status resolving."""
-    record_graded_object_statuses(user_id=user.id, scores=[_score(object_tag)])
+    record_graded_object_statuses(user_id=user.id, scores=[_passing_score(object_tag)])
     assert get_tags_locked_for_deletion([tag.id]) == {tag.id}
     assert is_taxonomy_locked_for_deletion(competency_taxonomy.id) is True
 
@@ -196,6 +196,7 @@ def test_deleting_locked_association_archives_it_and_protects_tag_and_taxonomy(
     assert object_tag.deletion_locked is True
     assert get_tags_locked_for_deletion([tag.id]) == {tag.id}
     assert is_taxonomy_locked_for_deletion(competency_taxonomy.id) is True
-    resolved = StudentCompetencyCriterionStatus.objects.get(criterion=criterion, user_id=user.id).criterion.object_tag
-    assert resolved.pk == object_tag.pk
-    assert resolved.archived is True
+    learner_status = StudentCompetencyCriterionStatus.objects.get(criterion=criterion, user_id=user.id)
+    object_tag_from_status = learner_status.criterion.object_tag
+    assert object_tag_from_status.pk == object_tag.pk
+    assert object_tag_from_status.archived is True
